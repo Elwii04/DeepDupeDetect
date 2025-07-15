@@ -2,7 +2,6 @@
 
 A high-performance, AI-powered tool designed to find duplicate and near-duplicate images within massive collections. This script is capable of processing over 1 million images, leveraging state-of-the-art deep learning models to identify visually similar images, even with variations in resolution, cropping, filters, and color.
 
-![image](https://user-images.githubusercontent.com/12345/your-reviewer-screenshot.png) <!-- It's highly recommended to replace this with a real screenshot of the reviewer GUI! -->
 
 ## ✨ Key Features
 
@@ -25,28 +24,17 @@ A high-performance, AI-powered tool designed to find duplicate and near-duplicat
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
+    git clone https://github.com//Elwii04/DeepDupeDetect.git
+    cd DeepDupeDetect
     ```
 
-2.  **Create and activate a virtual environment (recommended):**
-    ```bash
-    # For Windows
-    python -m venv venv
-    .\venv\Scripts\activate
-
-    # For macOS/Linux
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-
-3.  **Install PyTorch with CUDA support:** This is the most critical step. Visit the [official PyTorch website](https://pytorch.org/get-started/locally/) and select the correct options for your system (e.g., Pip, Windows/Linux, CUDA). Run the generated command. For example:
+2.  **Install PyTorch with CUDA support:** This is the most critical step. Visit the [official PyTorch website](https://pytorch.org/get-started/locally/) and select the correct options for your system (e.g., Pip, Windows/Linux, CUDA). Run the generated command. For example:
     ```bash
     # Example command for PyTorch with CUDA 12.1 - get the latest from the website!
     pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     ```
 
-4.  **Install all other required packages:**
+3.  **Install all other required packages:**
     ```bash
     pip install -r requirements.txt
     ```
