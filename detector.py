@@ -38,8 +38,7 @@ NUM_WORKERS = min(os.cpu_count() - 1, 8) if os.cpu_count() > 1 else 0
 
 # --- UI/UX BUG FIX ---
 class ReviewerGUI:
-    def __init__(self, root_path, duplicate_groups):
-        self.root_path = root_path
+    def __init__(self, duplicate_groups):
         self.groups = duplicate_groups
         self.current_group_index = 0
         
@@ -67,7 +66,7 @@ class ReviewerGUI:
         rows = int(np.ceil(num_images / cols))
         self.fig.suptitle(f'Duplicate Set {self.current_group_index + 1} of {len(self.groups)}', fontsize=16)
         try:
-            files_with_sizes = [(p, (self.root_path / p).stat().st_size) for p in group]
+            files_with_sizes = [(p, Path(p).stat().st_size) for p in group]
             files_with_sizes.sort(key=lambda x: x[1], reverse=True)
             file_to_keep = files_with_sizes[0][0]
         except FileNotFoundError:
@@ -76,11 +75,11 @@ class ReviewerGUI:
         for i, (path, size) in enumerate(files_with_sizes):
             ax = self.fig.add_subplot(rows, cols, i + 1)
             try:
-                img = Image.open(self.root_path / path).convert("RGB")
+                img = Image.open(Path(path)).convert("RGB")
                 img.thumbnail((400, 400))
                 ax.imshow(img)
             except Exception: ax.text(0.5, 0.5, "Error loading image", ha='center', va='center')
-            title = textwrap.fill(path, width=40)
+            title = textwrap.fill(Path(path).name, width=40)
             color = 'green' if path == file_to_keep else 'red'
             ax.set_title(title, color=color, fontsize=8)
             plt.setp(ax.spines.values(), color=color, linewidth=4)
@@ -113,21 +112,21 @@ class ReviewerGUI:
 
 # --- HIGHER PERFORMANCE: Custom Dataset Class for DataLoader ---
 class ImageDataset(Dataset):
-    def __init__(self, root_path, image_paths_relative, transform):
+    def __init__(self, root_path, image_paths_absolute, transform):
         self.root_path = root_path
-        self.image_paths = image_paths_relative
+        self.image_paths = image_paths_absolute
         self.transform = transform
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        rel_path = self.image_paths[idx]
-        full_path = self.root_path / rel_path
+        abs_path = self.image_paths[idx]
+        full_path = Path(abs_path)
         try:
             img = Image.open(full_path).convert('RGB')
             # The transform (including converting to tensor) happens here
-            return self.transform(img), rel_path
+            return self.transform(img), abs_path
         except Exception:
             # If an image is corrupt, return None so it can be filtered out
             return None, None
@@ -157,7 +156,7 @@ class ImageDeduplicator:
         self.model = None; self.preprocess = None
 
     def _initialize_database(self):
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS images (relative_path TEXT PRIMARY KEY, hash BLOB NOT NULL)")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS images (absolute_path TEXT PRIMARY KEY, hash BLOB NOT NULL)")
         self.conn.commit()
 
     def _initialize_model(self):
@@ -169,11 +168,11 @@ class ImageDeduplicator:
 
     def _get_image_files(self, rescan_all):
         print("Scanning for image files...")
-        all_files = {p.relative_to(self.root_path).as_posix() for p in self.root_path.rglob('*') if p.suffix.lower() in IMAGE_EXTENSIONS}
+        all_files = {p.as_posix() for p in self.root_path.rglob('*') if p.suffix.lower() in IMAGE_EXTENSIONS}
         print(f"Found {len(all_files)} total image files.")
         if rescan_all:
             print("Re-hashing all images as requested."); return list(all_files)
-        self.cursor.execute("SELECT relative_path FROM images")
+        self.cursor.execute("SELECT absolute_path FROM images")
         db_files = {row[0] for row in self.cursor.fetchall()}
         new_files = list(all_files - db_files)
         print(f"{len(new_files)} new or changed files to process."); return new_files
@@ -181,14 +180,14 @@ class ImageDeduplicator:
     # --- HIGHER PERFORMANCE: This function is now completely rebuilt ---
     def generate_hashes(self, rescan_all):
         self._initialize_model()
-        image_files_relative = self._get_image_files(rescan_all)
+        image_files_absolute = self._get_image_files(rescan_all)
         
-        if not image_files_relative:
+        if not image_files_absolute:
             print("No new images to hash. Database is up to date.")
             return
 
         # 1. Create the custom dataset
-        dataset = ImageDataset(self.root_path, image_files_relative, self.preprocess)
+        dataset = ImageDataset(self.root_path, image_files_absolute, self.preprocess)
         
         # 2. Create the DataLoader to run in parallel
         # pin_memory=True speeds up CPU-to-GPU transfers
@@ -217,7 +216,7 @@ class ImageDeduplicator:
             # Save the processed batch to the database
             cpu_features = features.cpu().numpy()
             db_entries = [(path, vec.tobytes()) for path, vec in zip(paths, cpu_features)]
-            self.cursor.executemany("INSERT OR REPLACE INTO images (relative_path, hash) VALUES (?, ?)", db_entries)
+            self.cursor.executemany("INSERT OR REPLACE INTO images (absolute_path, hash) VALUES (?, ?)", db_entries)
             self.conn.commit()
 
         print("Hashing complete.")
@@ -228,7 +227,7 @@ class ImageDeduplicator:
         Scans the database and removes entries for files that no longer exist on disk.
         """
         print("Verifying database against the file system...", flush=True)
-        self.cursor.execute("SELECT relative_path FROM images")
+        self.cursor.execute("SELECT absolute_path FROM images")
         # Fetch all paths as a flat list of strings
         all_db_paths = [row[0] for row in self.cursor.fetchall()]
 
@@ -238,10 +237,10 @@ class ImageDeduplicator:
 
         missing_files = []
         # Use tqdm for a progress bar during the check, as it can be slow on HDDs
-        for rel_path in tqdm(all_db_paths, desc="Checking files"):
-            full_path = self.root_path / rel_path
+        for abs_path in tqdm(all_db_paths, desc="Checking files"):
+            full_path = Path(abs_path)
             if not full_path.exists():
-                missing_files.append(rel_path)
+                missing_files.append(abs_path)
 
         if not missing_files:
             print("Database is clean. All file entries are valid.")
@@ -256,7 +255,7 @@ class ImageDeduplicator:
             # The data needs to be a list of tuples, e.g., [('path1',), ('path2',)]
             paths_to_delete = [(path,) for path in missing_files]
             
-            self.cursor.executemany("DELETE FROM images WHERE relative_path = ?", paths_to_delete)
+            self.cursor.executemany("DELETE FROM images WHERE absolute_path = ?", paths_to_delete)
             self.conn.commit()
             
             print(f"Successfully removed {len(missing_files)} ghost entries from the database.")
@@ -267,7 +266,7 @@ class ImageDeduplicator:
 
     def find_and_remove_duplicates(self):
         print("Loading all hashes from the database...")
-        self.cursor.execute("SELECT relative_path, hash FROM images")
+        self.cursor.execute("SELECT absolute_path, hash FROM images")
         rows = self.cursor.fetchall()
         
         if len(rows) < 2:
@@ -343,47 +342,47 @@ class ImageDeduplicator:
             return
 
         # Determine which files to mark for deletion before showing the GUI
-        files_to_delete_relative = set()
+        files_to_delete_absolute = set()
         for group in duplicate_groups:
             try:
-                files_with_sizes = [(p, (self.root_path / p).stat().st_size) for p in group]
+                files_with_sizes = [(p, Path(p).stat().st_size) for p in group]
                 files_with_sizes.sort(key=lambda x: x[1], reverse=True)
                 for path_to_del, size in files_with_sizes[1:]:
-                    files_to_delete_relative.add(path_to_del)
+                    files_to_delete_absolute.add(path_to_del)
             except FileNotFoundError:
                 print(f"Warning: A file was not found while analyzing a group. It will be skipped.")
                 continue
 
         print(f"\nFound {len(duplicate_groups)} sets of duplicates.")
-        print(f"A total of {len(files_to_delete_relative)} files are marked for deletion.")
+        print(f"A total of {len(files_to_delete_absolute)} files are marked for deletion.")
         print("Launching visual reviewer (close window to continue)...")
 
-        gui = ReviewerGUI(self.root_path, duplicate_groups)
+        gui = ReviewerGUI(duplicate_groups)
         gui.run()
 
-        if not files_to_delete_relative:
+        if not files_to_delete_absolute:
             print("No files marked for deletion.")
             return
 
         print("\n--- Deletion Confirmation ---")
-        confirm_input = input(f"CONFIRM: You are about to permanently delete {len(files_to_delete_relative)} marked files. This cannot be undone. Are you sure? (y/n): ").lower().strip()
+        confirm_input = input(f"CONFIRM: You are about to permanently delete {len(files_to_delete_absolute)} marked files. This cannot be undone. Are you sure? (y/n): ").lower().strip()
         
         if confirm_input == 'y':
             deleted_count = 0
-            for rel_path in tqdm(list(files_to_delete_relative), desc="Deleting Files"):
+            for abs_path in tqdm(list(files_to_delete_absolute), desc="Deleting Files"):
                 try:
-                    self.cursor.execute("DELETE FROM images WHERE relative_path = ?", (rel_path,))
-                    (self.root_path / rel_path).unlink()
+                    self.cursor.execute("DELETE FROM images WHERE absolute_path = ?", (abs_path,))
+                    Path(abs_path).unlink()
                     deleted_count += 1
                 except OSError as e:
-                    print(f"Error deleting {rel_path}: {e}")
+                    print(f"Error deleting {abs_path}: {e}")
             self.conn.commit()
             print(f"Successfully deleted {deleted_count} files.")
-            self._generate_summary(duplicate_groups, list(files_to_delete_relative))
+            self._generate_summary(duplicate_groups, list(files_to_delete_absolute))
         else:
             print("Deletion cancelled by user.")
 
-    def _generate_summary(self, initial_groups, deleted_files_relative):
+    def _generate_summary(self, initial_groups, deleted_files_absolute):
         # This function is unchanged
         print("\n" + "="*25 + " Deletion Summary " + "="*25)
         print(f"Total duplicate sets found: {len(initial_groups)}")
@@ -394,11 +393,10 @@ class ImageDeduplicator:
         print(f"  - Sets within a single folder: {len(initial_groups) - cross_folder_sets}")
         print(f"  - Sets spanning multiple folders: {cross_folder_sets}")
         print("-" * 68)
-        print(f"Total files deleted: {len(deleted_files_relative)}")
+        print(f"Total files deleted: {len(deleted_files_absolute)}")
         deletions_by_folder = defaultdict(int)
-        for rel_path in deleted_files_relative:
-            parent_folder = Path(rel_path).parent.as_posix()
-            if parent_folder == '.': parent_folder = '[ROOT FOLDER]'
+        for abs_path in deleted_files_absolute:
+            parent_folder = Path(abs_path).parent.as_posix()
             deletions_by_folder[parent_folder] += 1
         if deletions_by_folder:
             print("\nDeletions by subfolder:")
