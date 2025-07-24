@@ -30,8 +30,8 @@ BATCH_SIZE = 512 # CLIP is a bit larger, a smaller batch size is safer
 # You can try 0.95 or 0.96 if you find it's missing some duplicates.
 SIMILARITY_THRESHOLD = 0.99
 
-# CLIP ViT-B/32 model outputs a 512-dimension vector
-FEATURE_DIMENSION = 512
+# CLIP ViT-L-14 model outputs a 768-dimension vector
+FEATURE_DIMENSION = 768
 
 NUM_WORKERS = min(os.cpu_count() - 1, 8) if os.cpu_count() > 1 else 0
 
@@ -161,8 +161,8 @@ class ImageDeduplicator:
 
     def _initialize_model(self):
         if self.model is None:
-            print("Loading pre-trained model (OpenAI CLIP ViT-B/32)...")
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+            print("Loading pre-trained model (OpenAI CLIP ViT-L/14)...")
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
             self.model.to(self.device); self.model.eval()
             print("Model loaded.")
 
