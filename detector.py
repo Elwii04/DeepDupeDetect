@@ -162,7 +162,7 @@ class ImageDeduplicator:
     def _initialize_model(self):
         if self.model is None:
             print("Loading pre-trained model (OpenAI CLIP ViT-B/32)...")
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
             self.model.to(self.device); self.model.eval()
             print("Model loaded.")
 
