@@ -23,17 +23,24 @@ from matplotlib.widgets import Button
 # --- Configuration ---
 DB_NAME = "image_database.db"
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-BATCH_SIZE = 512 # CLIP is a bit larger, a smaller batch size is safer
 
 # --- ALGORITHM UPGRADE: New strict threshold for CLIP model ---
 # 1.0 is identical. 0.98 is very strict to avoid false positives.
 # You can try 0.95 or 0.96 if you find it's missing some duplicates.
-SIMILARITY_THRESHOLD = 0.99
+SIMILARITY_THRESHOLD = 0.98
 
-# CLIP ViT-L-14 model outputs a 768-dimension vector
-FEATURE_DIMENSION = 768
+# Model configurations
+CLIP_MODELS = {
+    'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 400},
+    'base': {'name': 'ViT-B-32', 'pretrained': 'openai', 'feature_dim': 512, 'batch_size': 512}
+}
 
-NUM_WORKERS = min(os.cpu_count() - 1, 8) if os.cpu_count() > 1 else 0
+# Default settings (will be overridden by user choice)
+CURRENT_MODEL_CONFIG = CLIP_MODELS['large']  # Default to large model
+FEATURE_DIMENSION = CURRENT_MODEL_CONFIG['feature_dim']
+USE_LAST_HIDDEN_LAYER = False  # Default to final embedding
+
+NUM_WORKERS = os.cpu_count() - 3 if os.cpu_count() > 1 else 0
 
 
 # --- UI/UX BUG FIX ---
@@ -154,6 +161,75 @@ class ImageDeduplicator:
         print(f"Using device: {self.device.upper()}")
         if 'cuda' not in self.device: print("Warning: CUDA not found. Processing will be significantly slower.")
         self.model = None; self.preprocess = None
+        # Model configuration will be set when user chooses
+        self.model_config = None
+        self.use_last_hidden_layer = None
+
+    def _get_model_choice(self):
+        """Get user's choice for CLIP model and embedding type."""
+        print("\n--- CLIP Model Selection ---")
+        print("Available models:")
+        print("  [1] ViT-Large-14 (768-dim, higher quality, slower) [DEFAULT]")
+        print("  [2] ViT-Base-32 (512-dim, faster, lower quality)")
+        
+        while True:
+            try:
+                choice = input("Select model (1-2) [1]: ").strip()
+                if choice == '' or choice == '1':
+                    self.model_config = CLIP_MODELS['large']
+                    break
+                elif choice == '2':
+                    self.model_config = CLIP_MODELS['base']
+                    break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except ValueError:
+                print("Invalid input. Please enter 1 or 2.")
+        
+        print(f"Selected: {self.model_config['name']} ({self.model_config['feature_dim']}-dimensional)")
+        
+        print("\n--- Embedding Type Selection ---")
+        print("Embedding types:")
+        print("  [1] Final embedding (for duplicate detection) [DEFAULT]")
+        print("  [2] Last hidden layer (for training/classification)")
+        
+        while True:
+            try:
+                choice = input("Select embedding type (1-2) [1]: ").strip()
+                if choice == '' or choice == '1':
+                    self.use_last_hidden_layer = False
+                    break
+                elif choice == '2':
+                    self.use_last_hidden_layer = True
+                    break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except ValueError:
+                print("Invalid input. Please enter 1 or 2.")
+        
+        embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+        print(f"Selected: {embedding_type}")
+        
+        # --- START OF FIX ---
+        # Dynamically set the feature dimension based on model and embedding type
+        if self.model_config['name'] == 'ViT-L-14' and self.use_last_hidden_layer:
+            # The last hidden layer of ViT-L is 1024-dimensional
+            self.model_config['feature_dim'] = 1024
+        elif self.model_config['name'] == 'ViT-L-14' and not self.use_last_hidden_layer:
+            # The final projected embedding is 768-dimensional
+            self.model_config['feature_dim'] = 768
+        # Add other conditions here if you use more models, e.g., ViT-B/32
+        elif self.model_config['name'] == 'ViT-B-32': # B/32 has a hidden dim of 768 and final dim of 512
+             self.model_config['feature_dim'] = 768 if self.use_last_hidden_layer else 512
+
+        # Update global variables for database compatibility
+        global FEATURE_DIMENSION, BATCH_SIZE, CURRENT_MODEL_CONFIG
+        CURRENT_MODEL_CONFIG = self.model_config
+        FEATURE_DIMENSION = self.model_config['feature_dim'] # This will now be correct (1024 or 768)
+        BATCH_SIZE = self.model_config['batch_size']
+        
+        print(f"Configuration: {self.model_config['name']} with {embedding_type} ({FEATURE_DIMENSION}-dim)")
+        # --- END OF FIX ---
 
     def _initialize_database(self):
         self.cursor.execute("CREATE TABLE IF NOT EXISTS images (absolute_path TEXT PRIMARY KEY, hash BLOB NOT NULL)")
@@ -161,10 +237,101 @@ class ImageDeduplicator:
 
     def _initialize_model(self):
         if self.model is None:
-            print("Loading pre-trained model (OpenAI CLIP ViT-L/14)...")
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
-            self.model.to(self.device); self.model.eval()
+            if self.model_config is None:
+                self._get_model_choice()
+            
+            print(f"Loading pre-trained model ({self.model_config['name']})...")
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                self.model_config['name'], 
+                pretrained=self.model_config['pretrained']
+            )
+            self.model.to(self.device)
+            self.model.eval()
             print("Model loaded.")
+
+    def _extract_features(self, image_batch):
+        """Extract features using either final embedding or last hidden layer."""
+        with torch.no_grad():
+            if self.use_last_hidden_layer:
+                # Extract last hidden layer (for training/classification)
+                # We need to get the raw transformer output before the final projection
+                
+                # Forward through the visual encoder to get the transformer output
+                x = self.model.visual.conv1(image_batch)  # patch embedding
+                x = x.reshape(x.shape[0], x.shape[1], -1)  # flatten patches
+                x = x.permute(0, 2, 1)  # change to (batch, seq_len, embed_dim)
+                
+                # Add class token and positional embeddings
+                x = torch.cat([self.model.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+                x = x + self.model.visual.positional_embedding.to(x.dtype)
+                
+                # Apply layer norm before transformer
+                x = self.model.visual.ln_pre(x)
+                
+                # Forward through transformer layers
+                x = x.permute(1, 0, 2)  # change to (seq_len, batch, embed_dim) for transformer
+                x = self.model.visual.transformer(x)
+                x = x.permute(1, 0, 2)  # change back to (batch, seq_len, embed_dim)
+                
+                # Get CLS token (first token) from last layer - this is the "last hidden layer"
+                features = x[:, 0, :]  # Shape: (batch, hidden_dim)
+                
+                print(f"DEBUG: Last hidden layer shape: {features.shape}")
+                
+            else:
+                # Standard final embedding (for duplicate detection)
+                features = self.model.encode_image(image_batch)
+            
+            # Normalize features
+            features = features / features.norm(dim=-1, keepdim=True)
+            return features
+
+    def _check_database_compatibility(self):
+        """Check if the database is compatible with the current model configuration."""
+        self.cursor.execute("SELECT COUNT(*) FROM images")
+        count = self.cursor.fetchone()[0]
+        
+        if count == 0:
+            return True  # Empty database is always compatible
+        
+        # Check a sample hash to determine the feature dimension
+        self.cursor.execute("SELECT hash FROM images LIMIT 1")
+        sample_hash = self.cursor.fetchone()[0]
+        stored_dim = len(np.frombuffer(sample_hash, dtype=np.float32))
+        
+        if stored_dim != self.model_config['feature_dim']:
+            print(f"\n⚠️  WARNING: Database dimension mismatch!")
+            print(f"Database contains {stored_dim}-dimensional features")
+            print(f"Selected model produces {self.model_config['feature_dim']}-dimensional features")
+            print("This means the database was created with a different model/embedding type.")
+            
+            user_choice = input("Do you want to re-hash all images with the new configuration? (y/n): ").lower().strip()
+            if user_choice == 'y':
+                # Clear the database
+                self.cursor.execute("DELETE FROM images")
+                self.conn.commit()
+                print("Database cleared. All images will be re-hashed.")
+                return True
+            else:
+                print("Keeping existing database. Note: Results may be inconsistent.")
+                # Update the global dimension to match the database
+                global FEATURE_DIMENSION
+                FEATURE_DIMENSION = stored_dim
+                self.model_config['feature_dim'] = stored_dim
+                return False
+        
+        return True
+
+    def _display_current_config(self):
+        """Display current model configuration."""
+        if self.model_config:
+            embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+            print(f"\nCurrent configuration:")
+            print(f"  Model: {self.model_config['name']}")
+            print(f"  Embedding: {embedding_type}")
+            print(f"  Dimensions: {self.model_config['feature_dim']}")
+            print(f"  Batch size: {self.model_config['batch_size']}")
+        return True
 
     def _get_image_files(self, rescan_all):
         print("Scanning for image files...")
@@ -180,20 +347,28 @@ class ImageDeduplicator:
     # --- HIGHER PERFORMANCE: This function is now completely rebuilt ---
     def generate_hashes(self, rescan_all):
         self._initialize_model()
+        
+        # Check database compatibility with current model configuration
+        if not rescan_all:
+            rescan_all = not self._check_database_compatibility()
+        
         image_files_absolute = self._get_image_files(rescan_all)
         
         if not image_files_absolute:
             print("No new images to hash. Database is up to date.")
             return
 
+        # Display current configuration
+        self._display_current_config()
+
         # 1. Create the custom dataset
         dataset = ImageDataset(self.root_path, image_files_absolute, self.preprocess)
         
         # 2. Create the DataLoader to run in parallel
-        # pin_memory=True speeds up CPU-to-GPU transfers
+        # Use the batch size from the selected model configuration
         data_loader = DataLoader(
             dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=self.model_config['batch_size'],
             shuffle=False,
             num_workers=NUM_WORKERS,
             collate_fn=collate_fn,
@@ -201,6 +376,8 @@ class ImageDeduplicator:
         )
         
         print(f"Starting hashing with {NUM_WORKERS} parallel workers...")
+        embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+        print(f"Using {self.model_config['name']} with {embedding_type}")
         
         # 3. Iterate over the DataLoader, which provides batches
         for image_batch, paths in tqdm(data_loader, desc="Hashing Images"):
@@ -209,9 +386,8 @@ class ImageDeduplicator:
             # Batches are already prepared, just move to GPU
             image_batch = image_batch.to(self.device)
             
-            with torch.no_grad():
-                features = self.model.encode_image(image_batch)
-                features /= features.norm(dim=-1, keepdim=True)
+            # Use the new feature extraction method
+            features = self._extract_features(image_batch)
             
             # Save the processed batch to the database
             cpu_features = features.cpu().numpy()
@@ -478,9 +654,9 @@ def get_folder_path():
 def get_run_mode():
     print("\nPlease select a mode to run:")
     print("  [1] Quick Filename Cleanup")
-    print("  [2] Generate/Update Image Hashes")
+    print("  [2] Generate/Update Image Hashes (will ask for model selection)")
     print("  [3] Find & Remove Duplicates (with Visual Reviewer)")
-    print("  [4] Full Workflow (Hash then Remove)")
+    print("  [4] Full Workflow (Hash then Remove - will ask for model selection)")
     print("  [5] Clean/Verify Database (removes entries for deleted files)")
     print("  [6] Exit")
     
@@ -504,7 +680,11 @@ def main():
             elif mode == 2:
                 rescan_choice = input("Re-hash ALL images (y) or only process NEW images (n)? [n]: ").lower().strip()
                 deduplicator.generate_hashes(rescan_all=(rescan_choice == 'y'))
-            elif mode == 3: deduplicator.find_and_remove_duplicates()
+            elif mode == 3: 
+                # Show current config if available
+                if deduplicator.model_config:
+                    deduplicator._display_current_config()
+                deduplicator.find_and_remove_duplicates()
             elif mode == 4:
                 print("\n--- Running Full Workflow ---")
                 rescan_choice = input("Re-hash ALL images (y) or only process NEW images (n)? [n]: ").lower().strip()
