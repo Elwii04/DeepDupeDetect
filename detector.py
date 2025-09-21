@@ -31,7 +31,7 @@ SIMILARITY_THRESHOLD = 0.98
 
 # Model configurations
 CLIP_MODELS = {
-    'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 400},
+    'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 450},
     'base': {'name': 'ViT-B-32', 'pretrained': 'openai', 'feature_dim': 512, 'batch_size': 512}
 }
 
@@ -164,6 +164,9 @@ class ImageDeduplicator:
         # Model configuration will be set when user chooses
         self.model_config = None
         self.use_last_hidden_layer = None
+        self.save_both_embeddings = False
+        self.last_hidden_dim = None
+        self.final_embedding_dim = None
 
     def _get_model_choice(self):
         """Get user's choice for CLIP model and embedding type."""
@@ -190,24 +193,34 @@ class ImageDeduplicator:
         
         print("\n--- Embedding Type Selection ---")
         print("Embedding types:")
-        print("  [1] Final embedding (for duplicate detection) [DEFAULT]")
-        print("  [2] Last hidden layer (for training/classification)")
+        print("  [1] Final embedding only (for duplicate detection) [DEFAULT]")
+        print("  [2] Last hidden layer only (for training/classification)")
+        print("  [3] Save both embeddings (dual hash columns)")
         
         while True:
             try:
-                choice = input("Select embedding type (1-2) [1]: ").strip()
+                choice = input("Select embedding type (1-3) [1]: ").strip()
                 if choice == '' or choice == '1':
                     self.use_last_hidden_layer = False
+                    self.save_both_embeddings = False
                     break
                 elif choice == '2':
                     self.use_last_hidden_layer = True
+                    self.save_both_embeddings = False
+                    break
+                elif choice == '3':
+                    self.use_last_hidden_layer = False  # Will extract both
+                    self.save_both_embeddings = True
                     break
                 else:
-                    print("Invalid choice. Please enter 1 or 2.")
+                    print("Invalid choice. Please enter 1, 2, or 3.")
             except ValueError:
-                print("Invalid input. Please enter 1 or 2.")
+                print("Invalid input. Please enter 1, 2, or 3.")
         
-        embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+        if self.save_both_embeddings:
+            embedding_type = "both embeddings (dual hash columns)"
+        else:
+            embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
         print(f"Selected: {embedding_type}")
         
         # --- START OF FIX ---
@@ -222,17 +235,47 @@ class ImageDeduplicator:
         elif self.model_config['name'] == 'ViT-B-32': # B/32 has a hidden dim of 768 and final dim of 512
              self.model_config['feature_dim'] = 768 if self.use_last_hidden_layer else 512
 
+        # Store dimensions for both embeddings when saving both
+        if self.save_both_embeddings:
+            if self.model_config['name'] == 'ViT-L-14':
+                self.last_hidden_dim = 1024
+                self.final_embedding_dim = 768
+            elif self.model_config['name'] == 'ViT-B-32':
+                self.last_hidden_dim = 768
+                self.final_embedding_dim = 512
+
         # Update global variables for database compatibility
         global FEATURE_DIMENSION, BATCH_SIZE, CURRENT_MODEL_CONFIG
         CURRENT_MODEL_CONFIG = self.model_config
         FEATURE_DIMENSION = self.model_config['feature_dim'] # This will now be correct (1024 or 768)
         BATCH_SIZE = self.model_config['batch_size']
         
-        print(f"Configuration: {self.model_config['name']} with {embedding_type} ({FEATURE_DIMENSION}-dim)")
+        print(f"Configuration: {self.model_config['name']} with {embedding_type}")
+        if self.save_both_embeddings:
+            print(f"  Last hidden layer: {self.last_hidden_dim}-dim")
+            print(f"  Final embedding: {self.final_embedding_dim}-dim")
+        else:
+            print(f"  Dimensions: {FEATURE_DIMENSION}")
         # --- END OF FIX ---
 
     def _initialize_database(self):
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS images (absolute_path TEXT PRIMARY KEY, hash BLOB NOT NULL)")
+        # Check if we need to update the database schema
+        self.cursor.execute("PRAGMA table_info(images)")
+        columns = [row[1] for row in self.cursor.fetchall()]
+        
+        if not columns:
+            # Create new table with dual hash support
+            self.cursor.execute("""
+                CREATE TABLE images (
+                    absolute_path TEXT PRIMARY KEY, 
+                    hash BLOB NOT NULL,
+                    final_embedding_hash BLOB
+                )
+            """)
+        elif 'final_embedding_hash' not in columns:
+            # Add the new column to existing table
+            self.cursor.execute("ALTER TABLE images ADD COLUMN final_embedding_hash BLOB")
+        
         self.conn.commit()
 
     def _initialize_model(self):
@@ -250,9 +293,40 @@ class ImageDeduplicator:
             print("Model loaded.")
 
     def _extract_features(self, image_batch):
-        """Extract features using either final embedding or last hidden layer."""
+        """Extract features using either final embedding, last hidden layer, or both."""
         with torch.no_grad():
-            if self.use_last_hidden_layer:
+            if self.save_both_embeddings:
+                # Extract both embeddings
+                # First get the last hidden layer
+                x = self.model.visual.conv1(image_batch)  # patch embedding
+                x = x.reshape(x.shape[0], x.shape[1], -1)  # flatten patches
+                x = x.permute(0, 2, 1)  # change to (batch, seq_len, embed_dim)
+                
+                # Add class token and positional embeddings
+                x = torch.cat([self.model.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+                x = x + self.model.visual.positional_embedding.to(x.dtype)
+                
+                # Apply layer norm before transformer
+                x = self.model.visual.ln_pre(x)
+                
+                # Forward through transformer layers
+                x = x.permute(1, 0, 2)  # change to (seq_len, batch, embed_dim) for transformer
+                x = self.model.visual.transformer(x)
+                x = x.permute(1, 0, 2)  # change back to (batch, seq_len, embed_dim)
+                
+                # Get CLS token (first token) from last layer - this is the "last hidden layer"
+                last_hidden_features = x[:, 0, :]  # Shape: (batch, hidden_dim)
+                
+                # Get final embedding through the projection head
+                final_features = self.model.encode_image(image_batch)
+                
+                # Normalize both features
+                last_hidden_features = last_hidden_features / last_hidden_features.norm(dim=-1, keepdim=True)
+                final_features = final_features / final_features.norm(dim=-1, keepdim=True)
+                
+                return last_hidden_features, final_features
+                
+            elif self.use_last_hidden_layer:
                 # Extract last hidden layer (for training/classification)
                 # We need to get the raw transformer output before the final projection
                 
@@ -282,9 +356,10 @@ class ImageDeduplicator:
                 # Standard final embedding (for duplicate detection)
                 features = self.model.encode_image(image_batch)
             
-            # Normalize features
-            features = features / features.norm(dim=-1, keepdim=True)
-            return features
+            # Normalize features (for single embedding case)
+            if not self.save_both_embeddings:
+                features = features / features.norm(dim=-1, keepdim=True)
+                return features
 
     def _check_database_compatibility(self):
         """Check if the database is compatible with the current model configuration."""
@@ -294,42 +369,71 @@ class ImageDeduplicator:
         if count == 0:
             return True  # Empty database is always compatible
         
-        # Check a sample hash to determine the feature dimension
-        self.cursor.execute("SELECT hash FROM images LIMIT 1")
-        sample_hash = self.cursor.fetchone()[0]
-        stored_dim = len(np.frombuffer(sample_hash, dtype=np.float32))
+        # Check for dual hash columns
+        self.cursor.execute("PRAGMA table_info(images)")
+        columns = [row[1] for row in self.cursor.fetchall()]
+        has_dual_columns = 'final_embedding_hash' in columns
         
-        if stored_dim != self.model_config['feature_dim']:
-            print(f"\n⚠️  WARNING: Database dimension mismatch!")
-            print(f"Database contains {stored_dim}-dimensional features")
-            print(f"Selected model produces {self.model_config['feature_dim']}-dimensional features")
-            print("This means the database was created with a different model/embedding type.")
+        if self.save_both_embeddings and not has_dual_columns:
+            print(f"\n⚠️  WARNING: Database structure mismatch!")
+            print("You selected dual hash mode but the database doesn't have the required columns.")
+            print("The database needs to be updated to support dual embeddings.")
             
-            user_choice = input("Do you want to re-hash all images with the new configuration? (y/n): ").lower().strip()
+            user_choice = input("Do you want to re-hash all images with dual embeddings? (y/n): ").lower().strip()
             if user_choice == 'y':
-                # Clear the database
+                # Clear the database and update schema
                 self.cursor.execute("DELETE FROM images")
                 self.conn.commit()
-                print("Database cleared. All images will be re-hashed.")
+                print("Database cleared. All images will be re-hashed with dual embeddings.")
                 return True
             else:
-                print("Keeping existing database. Note: Results may be inconsistent.")
-                # Update the global dimension to match the database
-                global FEATURE_DIMENSION
-                FEATURE_DIMENSION = stored_dim
-                self.model_config['feature_dim'] = stored_dim
+                print("Cannot proceed with dual embeddings on incompatible database.")
                 return False
+        
+        # Check a sample hash to determine the feature dimension (for single embedding modes)
+        if not self.save_both_embeddings:
+            self.cursor.execute("SELECT hash FROM images LIMIT 1")
+            sample_hash = self.cursor.fetchone()[0]
+            stored_dim = len(np.frombuffer(sample_hash, dtype=np.float32))
+            
+            if stored_dim != self.model_config['feature_dim']:
+                print(f"\n⚠️  WARNING: Database dimension mismatch!")
+                print(f"Database contains {stored_dim}-dimensional features")
+                print(f"Selected model produces {self.model_config['feature_dim']}-dimensional features")
+                print("This means the database was created with a different model/embedding type.")
+                
+                user_choice = input("Do you want to re-hash all images with the new configuration? (y/n): ").lower().strip()
+                if user_choice == 'y':
+                    # Clear the database
+                    self.cursor.execute("DELETE FROM images")
+                    self.conn.commit()
+                    print("Database cleared. All images will be re-hashed.")
+                    return True
+                else:
+                    print("Keeping existing database. Note: Results may be inconsistent.")
+                    # Update the global dimension to match the database
+                    global FEATURE_DIMENSION
+                    FEATURE_DIMENSION = stored_dim
+                    self.model_config['feature_dim'] = stored_dim
+                    return False
         
         return True
 
     def _display_current_config(self):
         """Display current model configuration."""
         if self.model_config:
-            embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+            if self.save_both_embeddings:
+                embedding_type = "both embeddings (dual hash columns)"
+            else:
+                embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
             print(f"\nCurrent configuration:")
             print(f"  Model: {self.model_config['name']}")
             print(f"  Embedding: {embedding_type}")
-            print(f"  Dimensions: {self.model_config['feature_dim']}")
+            if self.save_both_embeddings:
+                print(f"  Last hidden layer: {self.last_hidden_dim}-dim")
+                print(f"  Final embedding: {self.final_embedding_dim}-dim")
+            else:
+                print(f"  Dimensions: {self.model_config['feature_dim']}")
             print(f"  Batch size: {self.model_config['batch_size']}")
         return True
 
@@ -387,12 +491,29 @@ class ImageDeduplicator:
             image_batch = image_batch.to(self.device)
             
             # Use the new feature extraction method
-            features = self._extract_features(image_batch)
+            if self.save_both_embeddings:
+                last_hidden_features, final_features = self._extract_features(image_batch)
+                
+                # Save both embeddings to the database
+                cpu_last_hidden = last_hidden_features.cpu().numpy()
+                cpu_final = final_features.cpu().numpy()
+                
+                db_entries = [
+                    (path, last_hidden_vec.tobytes(), final_vec.tobytes()) 
+                    for path, last_hidden_vec, final_vec in zip(paths, cpu_last_hidden, cpu_final)
+                ]
+                self.cursor.executemany(
+                    "INSERT OR REPLACE INTO images (absolute_path, hash, final_embedding_hash) VALUES (?, ?, ?)", 
+                    db_entries
+                )
+            else:
+                features = self._extract_features(image_batch)
+                
+                # Save the processed batch to the database
+                cpu_features = features.cpu().numpy()
+                db_entries = [(path, vec.tobytes()) for path, vec in zip(paths, cpu_features)]
+                self.cursor.executemany("INSERT OR REPLACE INTO images (absolute_path, hash) VALUES (?, ?)", db_entries)
             
-            # Save the processed batch to the database
-            cpu_features = features.cpu().numpy()
-            db_entries = [(path, vec.tobytes()) for path, vec in zip(paths, cpu_features)]
-            self.cursor.executemany("INSERT OR REPLACE INTO images (absolute_path, hash) VALUES (?, ?)", db_entries)
             self.conn.commit()
 
         print("Hashing complete.")
@@ -440,9 +561,52 @@ class ImageDeduplicator:
 
 
 
+    def _get_duplicate_detection_embedding_choice(self):
+        """Get user's choice for which embedding to use for duplicate detection when both are available."""
+        # Check if both embeddings are available in the database
+        self.cursor.execute("PRAGMA table_info(images)")
+        columns = [row[1] for row in self.cursor.fetchall()]
+        has_dual_columns = 'final_embedding_hash' in columns
+        
+        if not has_dual_columns:
+            # Only single embedding available, use the hash column
+            return 'hash', 'single embedding'
+        
+        # Check if we actually have data in both columns
+        self.cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
+        dual_count = self.cursor.fetchone()[0]
+        
+        if dual_count == 0:
+            # No dual embeddings stored, use the hash column
+            return 'hash', 'single embedding'
+        
+        print("\n--- Duplicate Detection Embedding Selection ---")
+        print("Available embeddings for duplicate detection:")
+        print("  [1] Last hidden layer embedding (from 'hash' column) [DEFAULT]")
+        print("  [2] Final embedding (from 'final_embedding_hash' column)")
+        
+        while True:
+            try:
+                choice = input("Select embedding for duplicate detection (1-2) [1]: ").strip()
+                if choice == '' or choice == '1':
+                    return 'hash', 'last hidden layer'
+                elif choice == '2':
+                    return 'final_embedding_hash', 'final embedding'
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except ValueError:
+                print("Invalid input. Please enter 1 or 2.")
+
     def find_and_remove_duplicates(self):
-        print("Loading all hashes from the database...")
-        self.cursor.execute("SELECT absolute_path, hash FROM images")
+        # Get which embedding to use for duplicate detection
+        hash_column, embedding_description = self._get_duplicate_detection_embedding_choice()
+        
+        print(f"Loading all hashes from the database ({embedding_description})...")
+        if hash_column == 'hash':
+            self.cursor.execute("SELECT absolute_path, hash FROM images")
+        else:
+            self.cursor.execute("SELECT absolute_path, final_embedding_hash FROM images WHERE final_embedding_hash IS NOT NULL")
+        
         rows = self.cursor.fetchall()
         
         if len(rows) < 2:
@@ -451,41 +615,74 @@ class ImageDeduplicator:
 
         paths, hashes_blob = zip(*rows)
         num_images = len(paths)
-        hashes = np.frombuffer(b''.join(hashes_blob), dtype=np.float32).reshape(num_images, FEATURE_DIMENSION)
         
-        # --- BATCHED SIMILARITY SEARCH TO AVOID MEMORY ERROR ---
-        # This new approach processes the search in chunks to avoid creating a massive matrix.
+        # Determine the feature dimension from the first hash
+        sample_hash = hashes_blob[0]
+        feature_dim = len(np.frombuffer(sample_hash, dtype=np.float32))
         
-        CHUNK_SIZE = 4096 # Process 2048 images at a time. Adjust if you still see memory issues.
-        print(f"Finding duplicates for {num_images} images in chunks of {CHUNK_SIZE}...")
+        # Load hashes into a standard numpy array first
+        hashes_np = np.frombuffer(b''.join(hashes_blob), dtype=np.float32).reshape(num_images, feature_dim)
+        
+        print(f"Using {embedding_description} embeddings ({feature_dim}-dimensional) for duplicate detection")
+        print("Moving hashes to GPU for accelerated similarity search...")
+        
+        # --- GPU ACCELERATION UPGRADE ---
+        # 1. Convert numpy array to a PyTorch tensor
+        # 2. Move the entire tensor to the GPU
+        # 3. Use .half() or float16 for 2x speed and 2x less VRAM usage. It's perfect for similarity search.
+        try:
+            hashes_tensor = torch.from_numpy(hashes_np).to(self.device, non_blocking=True).half()
+            # non_blocking=True allows CPU to continue while data is transferring
+        except Exception as e:
+            print(f"Error moving hashes to GPU: {e}")
+            print("Falling back to CPU. This may be slow or cause memory errors.")
+            self.device = 'cpu'
+            hashes_tensor = torch.from_numpy(hashes_np).to(self.device).float() # CPU doesn't benefit from half() as much
 
-        # Step 1: Build a graph of connections (adjacency list)
-        # This is more memory-efficient than storing pairs directly.
+        # We can use a larger chunk size on the GPU. 8192 is a good starting point.
+        # Your 32GB 5090 can likely handle much more.
+        CHUNK_SIZE = 8192 
+        print(f"Finding duplicates for {num_images} images in chunks of {CHUNK_SIZE} on {self.device.upper()}...")
+
         adj = [set() for _ in range(num_images)]
         
         for i in tqdm(range(0, num_images, CHUNK_SIZE), desc="Calculating Similarities"):
-            chunk_hashes = hashes[i:i+CHUNK_SIZE]
+            # Get a chunk of hashes, which is already on the GPU
+            chunk_hashes = hashes_tensor[i:i+CHUNK_SIZE]
             
-            # Compare the chunk against the ENTIRE dataset
-            # This creates a manageable similarity matrix of shape (CHUNK_SIZE, num_images)
-            similarity_matrix_chunk = chunk_hashes @ hashes.T
+            # --- THE CORE GPU OPERATION ---
+            # Perform matrix multiplication ON THE GPU. This is extremely fast.
+            # (chunk_size, feature_dim) @ (feature_dim, num_images) -> (chunk_size, num_images)
+            similarity_matrix_chunk = chunk_hashes @ hashes_tensor.T
             
-            # Find pairs within this chunk that are above the threshold
-            # np.where gives us the row and column indices of the matches
-            row_indices, col_indices = np.where(similarity_matrix_chunk >= SIMILARITY_THRESHOLD)
+            # --- FILTERING ON GPU ---
+            # Find indices where similarity > threshold, also on the GPU
+            row_indices, col_indices = torch.where(similarity_matrix_chunk >= SIMILARITY_THRESHOLD)
 
+            # Move only the small result lists of indices back to the CPU for processing
+            row_indices = row_indices.cpu().numpy()
+            col_indices = col_indices.cpu().numpy()
+
+            # --- CPU-side processing of results ---
             for r, c in zip(row_indices, col_indices):
-                img_idx1 = i + r # The absolute index of the image from our chunk
-                img_idx2 = c      # The absolute index of the image from the full dataset
+                img_idx1 = i + r  # Absolute index from our chunk
+                img_idx2 = c      # Absolute index from the full dataset
                 
-                # Don't connect an image to itself
                 if img_idx1 == img_idx2:
                     continue
                 
-                adj[img_idx1].add(img_idx2)
-                adj[img_idx2].add(img_idx1)
+                # Check to avoid adding pairs twice, improving efficiency slightly
+                if img_idx1 < img_idx2:
+                    adj[img_idx1].add(img_idx2)
+                    adj[img_idx2].add(img_idx1)
 
-        # Step 2: Find connected components in the graph (these are the duplicate groups)
+            # --- VRAM Management ---
+            # Explicitly delete the large intermediate tensor to free VRAM for the next chunk
+            del similarity_matrix_chunk
+            if 'cuda' in self.device:
+                torch.cuda.empty_cache()
+
+        # Step 2: Find connected components (the rest of the function is the same)
         print("Connecting duplicate groups...")
         seen = set()
         duplicate_groups = []
@@ -493,7 +690,6 @@ class ImageDeduplicator:
             if i in seen:
                 continue
             
-            # Start a new group with a Breadth-First Search (BFS) to find all connected images
             component = []
             q = [i]
             seen.add(i)
@@ -508,16 +704,15 @@ class ImageDeduplicator:
                         seen.add(v)
                         q.append(v)
             
-            # Only consider groups with more than one image
             if len(component) > 1:
                 group_paths = [paths[j] for j in component]
                 duplicate_groups.append(group_paths)
 
+        # --- The rest of the function for reviewing and deleting remains unchanged ---
         if not duplicate_groups:
             print("No duplicate images found with the current threshold.")
             return
 
-        # Determine which files to mark for deletion before showing the GUI
         files_to_delete_absolute = set()
         for group in duplicate_groups:
             try:
@@ -529,7 +724,7 @@ class ImageDeduplicator:
                 print(f"Warning: A file was not found while analyzing a group. It will be skipped.")
                 continue
 
-        print(f"\nFound {len(duplicate_groups)} sets of duplicates.")
+        print(f"\nFound {len(duplicate_groups)} sets of duplicates using {embedding_description}.")
         print(f"A total of {len(files_to_delete_absolute)} files are marked for deletion.")
         print("Launching visual reviewer (close window to continue)...")
 
