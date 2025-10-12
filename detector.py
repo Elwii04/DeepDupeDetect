@@ -27,7 +27,7 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 # --- ALGORITHM UPGRADE: New strict threshold for CLIP model ---
 # 1.0 is identical. 0.98 is very strict to avoid false positives.
 # You can try 0.95 or 0.96 if you find it's missing some duplicates.
-SIMILARITY_THRESHOLD = 0.98
+SIMILARITY_THRESHOLD = 0.96
 
 # Model configurations
 CLIP_MODELS = {
@@ -598,97 +598,138 @@ class ImageDeduplicator:
                 print("Invalid input. Please enter 1 or 2.")
 
     def find_and_remove_duplicates(self):
-        # Get which embedding to use for duplicate detection
+        """
+        Finds duplicates using a memory-efficient, chunk-vs-chunk GPU comparison.
+        This algorithm is designed to handle massive datasets without causing OOM errors
+        by never loading the entire dataset into VRAM at once.
+        """
+        # --- CONFIGURATION: VRAM USAGE CONTROL ---
+        # This is the most important setting. It controls how many hashes are loaded into VRAM at once.
+        # A smaller number uses less VRAM but may be slightly slower due to more DB reads.
+        # A larger number uses more VRAM but can be faster.
+        # For your 32GB GPU, 65536 is a very safe value.
+        # 65536 * 65536 * 2 bytes (float16) = ~8.5 GB, which fits easily.
+        # You could likely increase this to 90000 or even 120000 for more speed if you wish.
+        MEGA_CHUNK_SIZE = 70000
+
+        # Get user's choice of embedding for the operation
         hash_column, embedding_description = self._get_duplicate_detection_embedding_choice()
-        
-        print(f"Loading all hashes from the database ({embedding_description})...")
-        if hash_column == 'hash':
-            self.cursor.execute("SELECT absolute_path, hash FROM images")
+        print(f"Using {embedding_description} embeddings for duplicate detection.")
+
+        # --- STEP 1: Fast initial queries ---
+        # Get the total number of images to process. This is a very fast query.
+        print("Getting image count from database...")
+        if hash_column == 'final_embedding_hash':
+            self.cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
         else:
-            self.cursor.execute("SELECT absolute_path, final_embedding_hash FROM images WHERE final_embedding_hash IS NOT NULL")
-        
-        rows = self.cursor.fetchall()
-        
-        if len(rows) < 2:
+            self.cursor.execute("SELECT COUNT(*) FROM images")
+        num_images = self.cursor.fetchone()[0]
+
+        if num_images < 2:
             print("Not enough images in the database to find duplicates.")
             return
 
-        paths, hashes_blob = zip(*rows)
-        num_images = len(paths)
+        # Get all file paths. Loading millions of strings is fine for RAM.
+        print("Loading all file paths into memory...")
+        if hash_column == 'final_embedding_hash':
+            self.cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL")
+        else:
+            self.cursor.execute("SELECT absolute_path FROM images")
+        paths = [row[0] for row in self.cursor.fetchall()]
         
-        # Determine the feature dimension from the first hash
-        sample_hash = hashes_blob[0]
-        feature_dim = len(np.frombuffer(sample_hash, dtype=np.float32))
-        
-        # Load hashes into a standard numpy array first
-        hashes_np = np.frombuffer(b''.join(hashes_blob), dtype=np.float32).reshape(num_images, feature_dim)
-        
-        print(f"Using {embedding_description} embeddings ({feature_dim}-dimensional) for duplicate detection")
-        print("Moving hashes to GPU for accelerated similarity search...")
-        
-        # --- GPU ACCELERATION UPGRADE ---
-        # 1. Convert numpy array to a PyTorch tensor
-        # 2. Move the entire tensor to the GPU
-        # 3. Use .half() or float16 for 2x speed and 2x less VRAM usage. It's perfect for similarity search.
-        try:
-            hashes_tensor = torch.from_numpy(hashes_np).to(self.device, non_blocking=True).half()
-            # non_blocking=True allows CPU to continue while data is transferring
-        except Exception as e:
-            print(f"Error moving hashes to GPU: {e}")
-            print("Falling back to CPU. This may be slow or cause memory errors.")
-            self.device = 'cpu'
-            hashes_tensor = torch.from_numpy(hashes_np).to(self.device).float() # CPU doesn't benefit from half() as much
+        # Determine the number of chunks we'll need to iterate through
+        num_mega_chunks = (num_images + MEGA_CHUNK_SIZE - 1) // MEGA_CHUNK_SIZE
+        print(f"Dataset of {num_images} images will be processed in {num_mega_chunks} mega-chunks.")
 
-        # We can use a larger chunk size on the GPU. 8192 is a good starting point.
-        # Your 32GB 5090 can likely handle much more.
-        CHUNK_SIZE = 8192 
-        print(f"Finding duplicates for {num_images} images in chunks of {CHUNK_SIZE} on {self.device.upper()}...")
-
+        # This will store the graph of connections between duplicate images
         adj = [set() for _ in range(num_images)]
-        
-        for i in tqdm(range(0, num_images, CHUNK_SIZE), desc="Calculating Similarities"):
-            # Get a chunk of hashes, which is already on the GPU
-            chunk_hashes = hashes_tensor[i:i+CHUNK_SIZE]
+
+        # --- HELPER FUNCTION for loading data in chunks ---
+        def _load_chunk_to_gpu(offset, size):
+            # This function reads a specific slice of hashes from the database.
+            # Using LIMIT and OFFSET is far more efficient for the HDD/SSD than fetchall().
+            query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+            self.cursor.execute(query, (size, offset))
             
-            # --- THE CORE GPU OPERATION ---
-            # Perform matrix multiplication ON THE GPU. This is extremely fast.
-            # (chunk_size, feature_dim) @ (feature_dim, num_images) -> (chunk_size, num_images)
-            similarity_matrix_chunk = chunk_hashes @ hashes_tensor.T
+            hashes_blob = [row[0] for row in self.cursor.fetchall()]
+            if not hashes_blob:
+                return None
+
+            # Determine feature dimension from the first blob
+            feature_dim = len(np.frombuffer(hashes_blob[0], dtype=np.float32))
             
-            # --- FILTERING ON GPU ---
-            # Find indices where similarity > threshold, also on the GPU
-            row_indices, col_indices = torch.where(similarity_matrix_chunk >= SIMILARITY_THRESHOLD)
+            # Convert raw bytes to a NumPy array, then to a GPU tensor with float16
+            hashes_np = np.frombuffer(b''.join(hashes_blob), dtype=np.float32).reshape(-1, feature_dim)
+            return torch.from_numpy(hashes_np).to(self.device, non_blocking=True).half()
 
-            # Move only the small result lists of indices back to the CPU for processing
-            row_indices = row_indices.cpu().numpy()
-            col_indices = col_indices.cpu().numpy()
+        # --- STEP 2: The Core Double-Loop Chunk-vs-Chunk Algorithm ---
+        pbar = tqdm(total=num_mega_chunks * (num_mega_chunks + 1) // 2, desc="Comparing Chunks")
 
-            # --- CPU-side processing of results ---
-            for r, c in zip(row_indices, col_indices):
-                img_idx1 = i + r  # Absolute index from our chunk
-                img_idx2 = c      # Absolute index from the full dataset
+        for i in range(num_mega_chunks):
+            offset_i = i * MEGA_CHUNK_SIZE
+            size_i = min(MEGA_CHUNK_SIZE, num_images - offset_i)
+            
+            # Load the first chunk (chunk_i)
+            tensor_i = _load_chunk_to_gpu(offset_i, size_i)
+
+            for j in range(i, num_mega_chunks):
+                pbar.set_description(f"Comparing chunk {i+1}/{num_mega_chunks} vs {j+1}/{num_mega_chunks}")
                 
-                if img_idx1 == img_idx2:
-                    continue
-                
-                # Check to avoid adding pairs twice, improving efficiency slightly
-                if img_idx1 < img_idx2:
-                    adj[img_idx1].add(img_idx2)
-                    adj[img_idx2].add(img_idx1)
+                offset_j = j * MEGA_CHUNK_SIZE
+                size_j = min(MEGA_CHUNK_SIZE, num_images - offset_j)
 
-            # --- VRAM Management ---
-            # Explicitly delete the large intermediate tensor to free VRAM for the next chunk
-            del similarity_matrix_chunk
+                if i == j:
+                    # Case 1: Comparing a chunk against itself (finds intra-chunk duplicates)
+                    tensor_j = tensor_i
+                    # Create the similarity matrix on the GPU
+                    similarity = tensor_j @ tensor_j.T
+                    # Use torch.triu to get the upper triangle, ignoring the diagonal.
+                    # This avoids self-comparisons (imgA vs imgA) and duplicate pairs (A-B vs B-A).
+                    rows, cols = torch.where(torch.triu(similarity, diagonal=1) >= SIMILARITY_THRESHOLD)
+                else:
+                    # Case 2: Comparing chunk_i against a different chunk_j
+                    tensor_j = _load_chunk_to_gpu(offset_j, size_j)
+                    if tensor_j is None: continue
+                    
+                    # Create the similarity matrix for the two different chunks
+                    similarity = tensor_i @ tensor_j.T
+                    rows, cols = torch.where(similarity >= SIMILARITY_THRESHOLD)
+
+                # Move results to CPU and update the adjacency list with ABSOLUTE indices
+                rows_cpu = rows.cpu().numpy()
+                cols_cpu = cols.cpu().numpy()
+
+                for r, c in zip(rows_cpu, cols_cpu):
+                    abs_idx1 = offset_i + r
+                    abs_idx2 = offset_j + c
+                    adj[abs_idx1].add(abs_idx2)
+                    adj[abs_idx2].add(abs_idx1)
+                
+                # --- CRITICAL MEMORY MANAGEMENT ---
+                # Explicitly delete tensors to free up VRAM before the next iteration
+                del similarity, rows, cols
+                if i != j and tensor_j is not None:
+                    del tensor_j
+                if 'cuda' in self.device:
+                    torch.cuda.empty_cache()
+                
+                pbar.update(1)
+
+            # We are done comparing tensor_i against all subsequent tensors
+            del tensor_i
             if 'cuda' in self.device:
                 torch.cuda.empty_cache()
+        
+        pbar.close()
 
-        # Step 2: Find connected components (the rest of the function is the same)
+        # --- STEP 3: Find connected groups (same as before) ---
+        # The rest of the function operates on the `adj` list, which is now fully populated.
+        # This part of the code does not consume significant memory.
         print("Connecting duplicate groups...")
         seen = set()
         duplicate_groups = []
         for i in range(num_images):
-            if i in seen:
-                continue
+            if i in seen: continue
             
             component = []
             q = [i]
