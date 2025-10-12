@@ -151,12 +151,34 @@ def collate_fn(batch):
 class ImageDeduplicator:
     # All other methods (init, initialize_model, find_and_remove, etc.) are the same.
     # Only generate_hashes and _get_image_files are updated.
-    def __init__(self, root_folder):
+    def __init__(self, root_folder, secondary_folder=None):
         self.root_path = Path(root_folder).resolve()
         if not self.root_path.is_dir():
             raise FileNotFoundError(f"Error: The specified folder does not exist: {self.root_path}")
-        self.db_path = self.root_path / DB_NAME; self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor(); self._initialize_database()
+        
+        # Multi-folder support
+        self.secondary_path = Path(secondary_folder).resolve() if secondary_folder else None
+        if self.secondary_path and not self.secondary_path.is_dir():
+            raise FileNotFoundError(f"Error: The specified secondary folder does not exist: {self.secondary_path}")
+        
+        self.is_multi_folder_mode = self.secondary_path is not None
+        
+        # Primary database connection
+        self.db_path = self.root_path / DB_NAME
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        self._initialize_database()
+        
+        # Secondary database connection (if in multi-folder mode)
+        self.secondary_conn = None
+        self.secondary_cursor = None
+        if self.is_multi_folder_mode:
+            self.secondary_db_path = self.secondary_path / DB_NAME
+            if not self.secondary_db_path.exists():
+                raise FileNotFoundError(f"Error: Database not found in secondary folder: {self.secondary_db_path}")
+            self.secondary_conn = sqlite3.connect(self.secondary_db_path)
+            self.secondary_cursor = self.secondary_conn.cursor()
+        
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device.upper()}")
         if 'cuda' not in self.device: print("Warning: CUDA not found. Processing will be significantly slower.")
@@ -597,11 +619,15 @@ class ImageDeduplicator:
             except ValueError:
                 print("Invalid input. Please enter 1 or 2.")
 
-    def find_and_remove_duplicates(self):
+    def find_and_remove_duplicates(self, custom_threshold=None):
         """
         Finds duplicates using a memory-efficient, chunk-vs-chunk GPU comparison.
         This algorithm is designed to handle massive datasets without causing OOM errors
         by never loading the entire dataset into VRAM at once.
+        Supports both single-folder and multi-folder (cross-database) duplicate detection.
+        
+        Args:
+            custom_threshold: Optional custom similarity threshold (0.0-1.0). If None, uses the default.
         """
         # --- CONFIGURATION: VRAM USAGE CONTROL ---
         # This is the most important setting. It controls how many hashes are loaded into VRAM at once.
@@ -612,21 +638,42 @@ class ImageDeduplicator:
         # You could likely increase this to 90000 or even 120000 for more speed if you wish.
         MEGA_CHUNK_SIZE = 70000
 
+        # Determine the similarity threshold to use
+        if custom_threshold is not None:
+            similarity_threshold = custom_threshold
+            print(f"Using custom similarity threshold: {similarity_threshold}")
+        else:
+            similarity_threshold = SIMILARITY_THRESHOLD
+            print(f"Using default similarity threshold: {similarity_threshold}")
+
         # Get user's choice of embedding for the operation
         hash_column, embedding_description = self._get_duplicate_detection_embedding_choice()
         print(f"Using {embedding_description} embeddings for duplicate detection.")
 
         # --- STEP 1: Fast initial queries ---
         # Get the total number of images to process. This is a very fast query.
-        print("Getting image count from database...")
+        print("Getting image count from database(s)...")
+        
+        # Load data from primary database
         if hash_column == 'final_embedding_hash':
             self.cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
         else:
             self.cursor.execute("SELECT COUNT(*) FROM images")
-        num_images = self.cursor.fetchone()[0]
+        num_images_primary = self.cursor.fetchone()[0]
+        
+        # Load data from secondary database if in multi-folder mode
+        num_images_secondary = 0
+        if self.is_multi_folder_mode:
+            if hash_column == 'final_embedding_hash':
+                self.secondary_cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
+            else:
+                self.secondary_cursor.execute("SELECT COUNT(*) FROM images")
+            num_images_secondary = self.secondary_cursor.fetchone()[0]
+        
+        num_images = num_images_primary + num_images_secondary
 
         if num_images < 2:
-            print("Not enough images in the database to find duplicates.")
+            print("Not enough images in the database(s) to find duplicates.")
             return
 
         # Get all file paths. Loading millions of strings is fine for RAM.
@@ -637,21 +684,60 @@ class ImageDeduplicator:
             self.cursor.execute("SELECT absolute_path FROM images")
         paths = [row[0] for row in self.cursor.fetchall()]
         
+        # Add secondary database paths if in multi-folder mode
+        if self.is_multi_folder_mode:
+            if hash_column == 'final_embedding_hash':
+                self.secondary_cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL")
+            else:
+                self.secondary_cursor.execute("SELECT absolute_path FROM images")
+            secondary_paths = [row[0] for row in self.secondary_cursor.fetchall()]
+            paths.extend(secondary_paths)
+        
+        # Track which database each image belongs to (for deletion strategy)
+        db_source = [1] * num_images_primary + [2] * num_images_secondary if self.is_multi_folder_mode else [1] * num_images
+        
         # Determine the number of chunks we'll need to iterate through
         num_mega_chunks = (num_images + MEGA_CHUNK_SIZE - 1) // MEGA_CHUNK_SIZE
         print(f"Dataset of {num_images} images will be processed in {num_mega_chunks} mega-chunks.")
+        if self.is_multi_folder_mode:
+            print(f"  Database 1: {num_images_primary} images from {self.root_path}")
+            print(f"  Database 2: {num_images_secondary} images from {self.secondary_path}")
 
         # This will store the graph of connections between duplicate images
         adj = [set() for _ in range(num_images)]
 
         # --- HELPER FUNCTION for loading data in chunks ---
         def _load_chunk_to_gpu(offset, size):
-            # This function reads a specific slice of hashes from the database.
-            # Using LIMIT and OFFSET is far more efficient for the HDD/SSD than fetchall().
-            query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
-            self.cursor.execute(query, (size, offset))
+            """Load a chunk of hashes from both databases."""
+            hashes_blob = []
             
-            hashes_blob = [row[0] for row in self.cursor.fetchall()]
+            # Determine which database(s) to read from based on offset
+            if offset < num_images_primary:
+                # Read from primary database
+                primary_start = offset
+                primary_size = min(size, num_images_primary - offset)
+                
+                query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                self.cursor.execute(query, (primary_size, primary_start))
+                hashes_blob.extend([row[0] for row in self.cursor.fetchall()])
+                
+                # If we need more, read from secondary database
+                if self.is_multi_folder_mode and len(hashes_blob) < size and (offset + size) > num_images_primary:
+                    secondary_start = 0
+                    secondary_size = (offset + size) - num_images_primary
+                    
+                    query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                    self.secondary_cursor.execute(query, (secondary_size, secondary_start))
+                    hashes_blob.extend([row[0] for row in self.secondary_cursor.fetchall()])
+            else:
+                # Read only from secondary database
+                secondary_start = offset - num_images_primary
+                secondary_size = size
+                
+                query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                self.secondary_cursor.execute(query, (secondary_size, secondary_start))
+                hashes_blob.extend([row[0] for row in self.secondary_cursor.fetchall()])
+            
             if not hashes_blob:
                 return None
 
@@ -663,7 +749,19 @@ class ImageDeduplicator:
             return torch.from_numpy(hashes_np).to(self.device, non_blocking=True).half()
 
         # --- STEP 2: The Core Double-Loop Chunk-vs-Chunk Algorithm ---
-        pbar = tqdm(total=num_mega_chunks * (num_mega_chunks + 1) // 2, desc="Comparing Chunks")
+        # In multi-folder mode, calculate chunks separately for each database
+        if self.is_multi_folder_mode:
+            num_chunks_primary = (num_images_primary + MEGA_CHUNK_SIZE - 1) // MEGA_CHUNK_SIZE
+            num_chunks_secondary = (num_images_secondary + MEGA_CHUNK_SIZE - 1) // MEGA_CHUNK_SIZE
+            total_comparisons = num_chunks_primary * num_chunks_secondary
+            print(f"Multi-folder mode: Only comparing BETWEEN databases (skipping within-database duplicates)")
+            print(f"  Database 1: {num_chunks_primary} chunks")
+            print(f"  Database 2: {num_chunks_secondary} chunks")
+            print(f"  Total cross-database comparisons: {total_comparisons}")
+        else:
+            total_comparisons = num_mega_chunks * (num_mega_chunks + 1) // 2
+        
+        pbar = tqdm(total=total_comparisons, desc="Comparing Chunks")
 
         for i in range(num_mega_chunks):
             offset_i = i * MEGA_CHUNK_SIZE
@@ -678,14 +776,26 @@ class ImageDeduplicator:
                 offset_j = j * MEGA_CHUNK_SIZE
                 size_j = min(MEGA_CHUNK_SIZE, num_images - offset_j)
 
+                # --- MULTI-FOLDER MODE: Skip comparisons within same database ---
+                if self.is_multi_folder_mode:
+                    # Determine which database each chunk belongs to
+                    chunk_i_db = 1 if offset_i < num_images_primary else 2
+                    chunk_j_db = 1 if offset_j < num_images_primary else 2
+                    
+                    # Skip if both chunks are from the same database
+                    if chunk_i_db == chunk_j_db:
+                        pbar.update(1)
+                        continue
+
                 if i == j:
                     # Case 1: Comparing a chunk against itself (finds intra-chunk duplicates)
+                    # This case is skipped in multi-folder mode due to the check above
                     tensor_j = tensor_i
                     # Create the similarity matrix on the GPU
                     similarity = tensor_j @ tensor_j.T
                     # Use torch.triu to get the upper triangle, ignoring the diagonal.
                     # This avoids self-comparisons (imgA vs imgA) and duplicate pairs (A-B vs B-A).
-                    rows, cols = torch.where(torch.triu(similarity, diagonal=1) >= SIMILARITY_THRESHOLD)
+                    rows, cols = torch.where(torch.triu(similarity, diagonal=1) >= similarity_threshold)
                 else:
                     # Case 2: Comparing chunk_i against a different chunk_j
                     tensor_j = _load_chunk_to_gpu(offset_j, size_j)
@@ -693,7 +803,7 @@ class ImageDeduplicator:
                     
                     # Create the similarity matrix for the two different chunks
                     similarity = tensor_i @ tensor_j.T
-                    rows, cols = torch.where(similarity >= SIMILARITY_THRESHOLD)
+                    rows, cols = torch.where(similarity >= similarity_threshold)
 
                 # Move results to CPU and update the adjacency list with ABSOLUTE indices
                 rows_cpu = rows.cpu().numpy()
@@ -754,13 +864,71 @@ class ImageDeduplicator:
             print("No duplicate images found with the current threshold.")
             return
 
+        # --- MULTI-FOLDER MODE: Get deletion strategy ---
+        deletion_strategy = 'largest'  # Default
+        preferred_db = None
+        
+        if self.is_multi_folder_mode:
+            print("\n--- Deletion Strategy Selection ---")
+            print("How would you like to handle duplicates across the two folders?")
+            print("  [1] Keep largest files (delete smaller duplicates from either folder) [DEFAULT]")
+            print(f"  [2] Keep files from Database 1 ({self.root_path})")
+            print(f"  [3] Keep files from Database 2 ({self.secondary_path})")
+            
+            while True:
+                try:
+                    choice = input("Select deletion strategy (1-3) [1]: ").strip()
+                    if choice == '' or choice == '1':
+                        deletion_strategy = 'largest'
+                        break
+                    elif choice == '2':
+                        deletion_strategy = 'prefer_db'
+                        preferred_db = 1
+                        break
+                    elif choice == '3':
+                        deletion_strategy = 'prefer_db'
+                        preferred_db = 2
+                        break
+                    else:
+                        print("Invalid choice. Please enter 1, 2, or 3.")
+                except ValueError:
+                    print("Invalid input. Please enter 1, 2, or 3.")
+            
+            if deletion_strategy == 'largest':
+                print("Selected: Keep largest files (current behavior)")
+            else:
+                print(f"Selected: Keep all files from Database {preferred_db}, delete duplicates from the other")
+
         files_to_delete_absolute = set()
         for group in duplicate_groups:
             try:
-                files_with_sizes = [(p, Path(p).stat().st_size) for p in group]
-                files_with_sizes.sort(key=lambda x: x[1], reverse=True)
-                for path_to_del, size in files_with_sizes[1:]:
-                    files_to_delete_absolute.add(path_to_del)
+                if deletion_strategy == 'largest':
+                    # Original behavior: keep the largest file
+                    files_with_sizes = [(p, Path(p).stat().st_size) for p in group]
+                    files_with_sizes.sort(key=lambda x: x[1], reverse=True)
+                    for path_to_del, size in files_with_sizes[1:]:
+                        files_to_delete_absolute.add(path_to_del)
+                else:
+                    # New behavior: keep files from preferred database
+                    files_with_db = []
+                    for p in group:
+                        path_idx = paths.index(p)
+                        files_with_db.append((p, db_source[path_idx]))
+                    
+                    # Check if preferred database has any files in this group
+                    has_preferred = any(db == preferred_db for _, db in files_with_db)
+                    
+                    if has_preferred:
+                        # Keep all files from preferred DB, delete from other DB
+                        for path, db in files_with_db:
+                            if db != preferred_db:
+                                files_to_delete_absolute.add(path)
+                    else:
+                        # If preferred DB has no files in this group, fall back to keeping largest
+                        files_with_sizes = [(p, Path(p).stat().st_size) for p, _ in files_with_db]
+                        files_with_sizes.sort(key=lambda x: x[1], reverse=True)
+                        for path_to_del, size in files_with_sizes[1:]:
+                            files_to_delete_absolute.add(path_to_del)
             except FileNotFoundError:
                 print(f"Warning: A file was not found while analyzing a group. It will be skipped.")
                 continue
@@ -783,12 +951,24 @@ class ImageDeduplicator:
             deleted_count = 0
             for abs_path in tqdm(list(files_to_delete_absolute), desc="Deleting Files"):
                 try:
-                    self.cursor.execute("DELETE FROM images WHERE absolute_path = ?", (abs_path,))
+                    # Determine which database this file belongs to
+                    path_idx = paths.index(abs_path)
+                    file_db = db_source[path_idx]
+                    
+                    # Delete from the appropriate database
+                    if file_db == 1:
+                        self.cursor.execute("DELETE FROM images WHERE absolute_path = ?", (abs_path,))
+                        self.conn.commit()
+                    else:
+                        self.secondary_cursor.execute("DELETE FROM images WHERE absolute_path = ?", (abs_path,))
+                        self.secondary_conn.commit()
+                    
+                    # Delete the actual file
                     Path(abs_path).unlink()
                     deleted_count += 1
                 except OSError as e:
                     print(f"Error deleting {abs_path}: {e}")
-            self.conn.commit()
+            
             print(f"Successfully deleted {deleted_count} files.")
             self._generate_summary(duplicate_groups, list(files_to_delete_absolute))
         else:
@@ -879,40 +1059,90 @@ class ImageDeduplicator:
 
     def close(self):
         self.conn.close()
+        if self.secondary_conn:
+            self.secondary_conn.close()
 
 # --- Simplified main loop with clearer prompts ---
-def get_folder_path():
+def get_folder_path(prompt="Please enter the full path to your image folder: "):
     while True:
-        folder_path = input("Please enter the full path to your image folder: ").strip()
+        folder_path = input(prompt).strip()
         if Path(folder_path).is_dir(): return folder_path
         else: print("Error: The path you entered is not a valid directory. Please try again.")
 
-def get_run_mode():
+def get_run_mode(is_multi_folder=False):
     print("\nPlease select a mode to run:")
-    print("  [1] Quick Filename Cleanup")
-    print("  [2] Generate/Update Image Hashes (will ask for model selection)")
-    print("  [3] Find & Remove Duplicates (with Visual Reviewer)")
-    print("  [4] Full Workflow (Hash then Remove - will ask for model selection)")
-    print("  [5] Clean/Verify Database (removes entries for deleted files)")
-    print("  [6] Exit")
+    
+    if is_multi_folder:
+        # Simplified menu for multi-folder mode
+        print("  [1] Quick Filename Cleanup")
+        print("  [2] Find & Remove Duplicates (with Visual Reviewer)")
+        print("  [3] Exit")
+        
+        while True:
+            try:
+                choice = int(input("Enter your choice (1-3): ").strip())
+                if choice == 1: return 1
+                elif choice == 2: return 3  # Map to option 3 (find duplicates)
+                elif choice == 3: return 6  # Map to option 6 (exit)
+                else: print("Invalid choice. Please enter a number between 1 and 3.")
+            except ValueError: print("Invalid input. Please enter a number.")
+    else:
+        # Full menu for single-folder mode
+        print("  [1] Quick Filename Cleanup")
+        print("  [2] Generate/Update Image Hashes (will ask for model selection)")
+        print("  [3] Find & Remove Duplicates (with Visual Reviewer)")
+        print("  [4] Full Workflow (Hash then Remove - will ask for model selection)")
+        print("  [5] Clean/Verify Database (removes entries for deleted files)")
+        print("  [6] Add Another Folder Path (for cross-database duplicate detection)")
+        print("  [7] Exit")
+        
+        while True:
+            try:
+                choice = int(input("Enter your choice (1-7): ").strip())
+                if 1 <= choice <= 7: return choice
+                else: print("Invalid choice. Please enter a number between 1 and 7.")
+            except ValueError: print("Invalid input. Please enter a number.")
+
+def get_custom_threshold():
+    """Prompt user for custom similarity threshold."""
+    print(f"\n--- Similarity Threshold Configuration ---")
+    print(f"Current default threshold: {SIMILARITY_THRESHOLD}")
+    print("Range: 0.0 (very loose) to 1.0 (identical)")
+    print("Recommended values:")
+    print("  0.98-1.0  = Very strict (nearly identical)")
+    print("  0.95-0.97 = Strict (very similar)")
+    print("  0.90-0.94 = Moderate (similar)")
+    print("  0.85-0.89 = Loose (somewhat similar)")
     
     while True:
+        choice = input(f"\nUse default ({SIMILARITY_THRESHOLD}) or enter custom value (0.0-1.0) [default]: ").strip()
+        
+        if choice == '':
+            return None  # Use default
+        
         try:
-            choice = int(input("Enter your choice (1-6): ").strip())
-            if 1 <= choice <= 6: return choice
-            else: print("Invalid choice. Please enter a number between 1 and 6.")
-        except ValueError: print("Invalid input. Please enter a number.")
+            threshold = float(choice)
+            if 0.0 <= threshold <= 1.0:
+                return threshold
+            else:
+                print("Error: Threshold must be between 0.0 and 1.0")
+        except ValueError:
+            print("Error: Invalid number. Please enter a decimal value between 0.0 and 1.0")
 
 def main():
     print("--- Welcome to the GPU-Accelerated Image Deduplicator ---")
     folder = get_folder_path()
     
+    # Initialize with single folder
     deduplicator = ImageDeduplicator(folder)
+    is_multi_folder = False
     
     try:
         while True:
-            mode = get_run_mode()
-            if mode == 1: deduplicator.run_filename_pass()
+            mode = get_run_mode(is_multi_folder)
+            
+            if mode == 1: 
+                deduplicator.run_filename_pass()
             elif mode == 2:
                 rescan_choice = input("Re-hash ALL images (y) or only process NEW images (n)? [n]: ").lower().strip()
                 deduplicator.generate_hashes(rescan_all=(rescan_choice == 'y'))
@@ -920,19 +1150,48 @@ def main():
                 # Show current config if available
                 if deduplicator.model_config:
                     deduplicator._display_current_config()
-                deduplicator.find_and_remove_duplicates()
+                # Ask for custom threshold
+                custom_threshold = get_custom_threshold()
+                deduplicator.find_and_remove_duplicates(custom_threshold=custom_threshold)
             elif mode == 4:
                 print("\n--- Running Full Workflow ---")
                 rescan_choice = input("Re-hash ALL images (y) or only process NEW images (n)? [n]: ").lower().strip()
                 print("\nStep 1: Hashing images...")
                 deduplicator.generate_hashes(rescan_all=(rescan_choice == 'y'))
                 print("\nStep 2: Finding and removing duplicates...")
-                deduplicator.find_and_remove_duplicates()
+                # Ask for custom threshold
+                custom_threshold = get_custom_threshold()
+                deduplicator.find_and_remove_duplicates(custom_threshold=custom_threshold)
                 print("\n--- Full Workflow Complete ---")
-            elif mode == 5: # This is the new mode
+            elif mode == 5:
                 deduplicator.clean_database()
-            elif mode == 6: # Exit is now option 6
-                print("Exiting."); break
+            elif mode == 6 and not is_multi_folder:
+                # Add another folder path
+                print("\n--- Adding Second Folder ---")
+                print("Note: The second folder must already have a database (image_database.db).")
+                print("If you haven't hashed the images in the second folder yet, please do that first.")
+                
+                add_folder = input("\nDo you want to add a second folder path? (y/n): ").lower().strip()
+                if add_folder == 'y':
+                    secondary_folder = get_folder_path("Please enter the full path to the second image folder: ")
+                    
+                    # Check if database exists in secondary folder
+                    secondary_db_path = Path(secondary_folder) / DB_NAME
+                    if not secondary_db_path.exists():
+                        print(f"\nError: No database found in {secondary_folder}")
+                        print("Please run the hashing operation on this folder first (in a separate session).")
+                        continue
+                    
+                    # Close current deduplicator and create new one with both folders
+                    deduplicator.close()
+                    deduplicator = ImageDeduplicator(folder, secondary_folder)
+                    is_multi_folder = True
+                    print(f"\n✓ Successfully added second folder: {secondary_folder}")
+                    print("You can now find duplicates across both databases!")
+            elif mode == 6 or mode == 7:
+                print("Exiting.")
+                break
+                
             print("\n" + "="*50 + "\n")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
