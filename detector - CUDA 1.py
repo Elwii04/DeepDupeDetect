@@ -13,9 +13,8 @@ from torch.utils.data import Dataset, DataLoader
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module='timm.models.layers')
 
-# --- ALGORITHM UPGRADE: Using OpenAI CLIP and DINOv3 ---
+# --- ALGORITHM UPGRADE: Using OpenAI CLIP ---
 import open_clip
-from transformers import AutoImageProcessor, AutoModel
 
 # --- UI UPGRADE: Using Matplotlib for the viewer ---
 import matplotlib.pyplot as plt
@@ -30,14 +29,10 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 # You can try 0.95 or 0.96 if you find it's missing some duplicates.
 SIMILARITY_THRESHOLD = 0.96
 
-# Model configurations
+# Model configurations - adjusted for 16GB VRAM (halved batch sizes)
 CLIP_MODELS = {
-    'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 450, 'type': 'clip'},
-    'base': {'name': 'ViT-B-32', 'pretrained': 'openai', 'feature_dim': 512, 'batch_size': 512, 'type': 'clip'}
-}
-
-DINOV3_MODELS = {
-    'vitl': {'name': 'facebook/dinov3-vitl16-pretrain-lvd1689m', 'feature_dim': 1024, 'batch_size': 400, 'type': 'dinov3'}
+    'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 225},
+    'base': {'name': 'ViT-B-32', 'pretrained': 'openai', 'feature_dim': 512, 'batch_size': 256}
 }
 
 # Default settings (will be overridden by user choice)
@@ -124,11 +119,10 @@ class ReviewerGUI:
 
 # --- HIGHER PERFORMANCE: Custom Dataset Class for DataLoader ---
 class ImageDataset(Dataset):
-    def __init__(self, root_path, image_paths_absolute, transform, model_type='clip'):
+    def __init__(self, root_path, image_paths_absolute, transform):
         self.root_path = root_path
         self.image_paths = image_paths_absolute
         self.transform = transform
-        self.model_type = model_type
 
     def __len__(self):
         return len(self.image_paths)
@@ -139,43 +133,18 @@ class ImageDataset(Dataset):
         try:
             img = Image.open(full_path).convert('RGB')
             # The transform (including converting to tensor) happens here
-            if self.model_type == 'dinov3':
-                # For DINOv3, the processor expects PIL images
-                return self.transform(images=img, return_tensors="pt"), abs_path
-            else:
-                # For CLIP, use standard transform
-                return self.transform(img), abs_path
+            return self.transform(img), abs_path
         except Exception:
             # If an image is corrupt, return None so it can be filtered out
             return None, None
 
-def collate_fn_clip(batch):
-    # Custom collate function to filter out failed images (None) for CLIP
+def collate_fn(batch):
+    # Custom collate function to filter out failed images (None)
     batch = [b for b in batch if b[0] is not None]
     if not batch:
         return None, None
     images, paths = zip(*batch)
     return torch.stack(images, 0), paths
-
-def collate_fn_dinov3(batch):
-    # Custom collate function for DINOv3
-    batch = [b for b in batch if b[0] is not None]
-    if not batch:
-        return None, None
-    
-    # For DINOv3, each item is a dict with 'pixel_values'
-    pixel_values_list = []
-    paths = []
-    
-    for item, path in batch:
-        # item is a dict from the processor
-        pixel_values_list.append(item['pixel_values'].squeeze(0))  # Remove batch dim from individual items
-        paths.append(path)
-    
-    # Stack all pixel values
-    pixel_values = torch.stack(pixel_values_list, 0)
-    
-    return pixel_values, paths
 
 
 
@@ -210,9 +179,16 @@ class ImageDeduplicator:
             self.secondary_conn = sqlite3.connect(self.secondary_db_path)
             self.secondary_cursor = self.secondary_conn.cursor()
         
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        print(f"Using device: {self.device.upper()}")
-        if 'cuda' not in self.device: print("Warning: CUDA not found. Processing will be significantly slower.")
+        # Force CUDA:1 usage, never fall back to CPU
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available! This script requires a CUDA-capable GPU.")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("CUDA:1 not found! This script requires GPU 1 (cuda:1). Only found {} GPU(s).".format(torch.cuda.device_count()))
+        
+        self.device = 'cuda:1'
+        torch.cuda.set_device(1)  # Set default CUDA device to GPU 1
+        print(f"Using device: {self.device.upper()} - GPU: {torch.cuda.get_device_name(1)}")
+        print(f"Available VRAM: {torch.cuda.get_device_properties(1).total_memory / 1024**3:.1f} GB")
         self.model = None; self.preprocess = None
         # Model configuration will be set when user chooses
         self.model_config = None
@@ -222,78 +198,63 @@ class ImageDeduplicator:
         self.final_embedding_dim = None
 
     def _get_model_choice(self):
-        """Get user's choice for model and embedding type."""
-        print("\n--- Model Selection ---")
+        """Get user's choice for CLIP model and embedding type."""
+        print("\n--- CLIP Model Selection ---")
         print("Available models:")
-        print("  [1] CLIP ViT-Large-14 (768-dim, higher quality, slower) [DEFAULT]")
-        print("  [2] CLIP ViT-Base-32 (512-dim, faster, lower quality)")
-        print("  [3] DINOv3 ViT-Large (1024-dim, excellent dense features)")
+        print("  [1] ViT-Large-14 (768-dim, higher quality, slower) [DEFAULT]")
+        print("  [2] ViT-Base-32 (512-dim, faster, lower quality)")
         
         while True:
             try:
-                choice = input("Select model (1-3) [1]: ").strip()
+                choice = input("Select model (1-2) [1]: ").strip()
                 if choice == '' or choice == '1':
                     self.model_config = CLIP_MODELS['large']
                     break
                 elif choice == '2':
                     self.model_config = CLIP_MODELS['base']
                     break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except ValueError:
+                print("Invalid input. Please enter 1 or 2.")
+        
+        print(f"Selected: {self.model_config['name']} ({self.model_config['feature_dim']}-dimensional)")
+        
+        print("\n--- Embedding Type Selection ---")
+        print("Embedding types:")
+        print("  [1] Final embedding only (for duplicate detection) [DEFAULT]")
+        print("  [2] Last hidden layer only (for training/classification)")
+        print("  [3] Save both embeddings (dual hash columns)")
+        
+        while True:
+            try:
+                choice = input("Select embedding type (1-3) [1]: ").strip()
+                if choice == '' or choice == '1':
+                    self.use_last_hidden_layer = False
+                    self.save_both_embeddings = False
+                    break
+                elif choice == '2':
+                    self.use_last_hidden_layer = True
+                    self.save_both_embeddings = False
+                    break
                 elif choice == '3':
-                    self.model_config = DINOV3_MODELS['vitl']
+                    self.use_last_hidden_layer = False  # Will extract both
+                    self.save_both_embeddings = True
                     break
                 else:
                     print("Invalid choice. Please enter 1, 2, or 3.")
             except ValueError:
                 print("Invalid input. Please enter 1, 2, or 3.")
         
-        print(f"Selected: {self.model_config['name']} ({self.model_config['feature_dim']}-dimensional)")
-        
-        # DINOv3 only supports pooler output, skip embedding selection
-        if self.model_config['type'] == 'dinov3':
-            print("\nDINOv3 will use pooler output (no embedding type selection needed)")
-            self.use_last_hidden_layer = False
-            self.save_both_embeddings = False
-            embedding_type = "pooler output"
+        if self.save_both_embeddings:
+            embedding_type = "both embeddings (dual hash columns)"
         else:
-            # CLIP models support different embedding types
-            print("\n--- Embedding Type Selection ---")
-            print("Embedding types:")
-            print("  [1] Final embedding only (for duplicate detection) [DEFAULT]")
-            print("  [2] Last hidden layer only (for training/classification)")
-            print("  [3] Save both embeddings (dual hash columns)")
-            
-            while True:
-                try:
-                    choice = input("Select embedding type (1-3) [1]: ").strip()
-                    if choice == '' or choice == '1':
-                        self.use_last_hidden_layer = False
-                        self.save_both_embeddings = False
-                        break
-                    elif choice == '2':
-                        self.use_last_hidden_layer = True
-                        self.save_both_embeddings = False
-                        break
-                    elif choice == '3':
-                        self.use_last_hidden_layer = False  # Will extract both
-                        self.save_both_embeddings = True
-                        break
-                    else:
-                        print("Invalid choice. Please enter 1, 2, or 3.")
-                except ValueError:
-                    print("Invalid input. Please enter 1, 2, or 3.")
-            
-            if self.save_both_embeddings:
-                embedding_type = "both embeddings (dual hash columns)"
-            else:
-                embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
-            print(f"Selected: {embedding_type}")
+            embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+        print(f"Selected: {embedding_type}")
         
         # --- START OF FIX ---
         # Dynamically set the feature dimension based on model and embedding type
-        if self.model_config['type'] == 'dinov3':
-            # DINOv3 uses pooler output (already set in model config)
-            pass
-        elif self.model_config['name'] == 'ViT-L-14' and self.use_last_hidden_layer:
+        if self.model_config['name'] == 'ViT-L-14' and self.use_last_hidden_layer:
             # The last hidden layer of ViT-L is 1024-dimensional
             self.model_config['feature_dim'] = 1024
         elif self.model_config['name'] == 'ViT-L-14' and not self.use_last_hidden_layer:
@@ -352,40 +313,17 @@ class ImageDeduplicator:
                 self._get_model_choice()
             
             print(f"Loading pre-trained model ({self.model_config['name']})...")
-            
-            if self.model_config['type'] == 'dinov3':
-                # Load DINOv3 model
-                self.preprocess = AutoImageProcessor.from_pretrained(self.model_config['name'])
-                self.model = AutoModel.from_pretrained(
-                    self.model_config['name'],
-                    device_map=self.device,
-                    torch_dtype=torch.float16 if 'cuda' in self.device else torch.float32
-                )
-                self.model.eval()
-            else:
-                # Load CLIP model
-                self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                    self.model_config['name'], 
-                    pretrained=self.model_config['pretrained']
-                )
-                self.model.to(self.device)
-                self.model.eval()
-            
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                self.model_config['name'], 
+                pretrained=self.model_config['pretrained']
+            )
+            self.model.to(self.device)
+            self.model.eval()
             print("Model loaded.")
 
     def _extract_features(self, image_batch):
         """Extract features using either final embedding, last hidden layer, or both."""
         with torch.no_grad():
-            # Handle DINOv3 models
-            if self.model_config['type'] == 'dinov3':
-                # DINOv3 uses pooler output
-                outputs = self.model(pixel_values=image_batch)
-                features = outputs.pooler_output
-                # Normalize features
-                features = features / features.norm(dim=-1, keepdim=True)
-                return features
-            
-            # Handle CLIP models
             if self.save_both_embeddings:
                 # Extract both embeddings
                 # First get the last hidden layer
@@ -557,18 +495,10 @@ class ImageDeduplicator:
         self._display_current_config()
 
         # 1. Create the custom dataset
-        dataset = ImageDataset(
-            self.root_path, 
-            image_files_absolute, 
-            self.preprocess,
-            model_type=self.model_config['type']
-        )
+        dataset = ImageDataset(self.root_path, image_files_absolute, self.preprocess)
         
         # 2. Create the DataLoader to run in parallel
         # Use the batch size from the selected model configuration
-        # Choose appropriate collate function based on model type
-        collate_fn = collate_fn_dinov3 if self.model_config['type'] == 'dinov3' else collate_fn_clip
-        
         data_loader = DataLoader(
             dataset,
             batch_size=self.model_config['batch_size'],
@@ -710,10 +640,9 @@ class ImageDeduplicator:
         # This is the most important setting. It controls how many hashes are loaded into VRAM at once.
         # A smaller number uses less VRAM but may be slightly slower due to more DB reads.
         # A larger number uses more VRAM but can be faster.
-        # For your 32GB GPU, 65536 is a very safe value.
-        # 65536 * 65536 * 2 bytes (float16) = ~8.5 GB, which fits easily.
-        # You could likely increase this to 90000 or even 120000 for more speed if you wish.
-        MEGA_CHUNK_SIZE = 70000
+        # For your 16GB GPU, 45000 is a safe value to avoid OOM errors.
+        # 45000 * 45000 * 2 bytes (float16) = ~4 GB, which leaves plenty of headroom.
+        MEGA_CHUNK_SIZE = 45000
 
         # Determine the similarity threshold to use
         if custom_threshold is not None:

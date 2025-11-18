@@ -4,6 +4,7 @@ torchvision>=0.16.0
 
 # Model and image processing libraries
 open-clip-torch>=2.20.0
+transformers>=4.30.0
 Pillow>=9.5.0
 tqdm>=4.65.0
 
