@@ -1,0 +1,125 @@
+{
+  "test_config": {
+    "database": "H:\\Raw Datasets\\Pinterest Downloader\\Downloads\\image_database - Kopie.db",
+    "num_test_images": 5000,
+    "num_query_samples": 200,
+    "timestamp": "2026-02-07T11:16:29.093229"
+  },
+  "original_embeddings": {
+    "model": "DINOv3 ViT-L (from database)",
+    "dimension": 1024,
+    "num_samples": 5000,
+    "storage_bytes": 20480000,
+    "storage_mb": 19.53125
+  },
+  "compression": {
+    "float16": {
+      "storage": {
+        "original_bytes": 20480000,
+        "compressed_bytes": 10240000,
+        "original_mb": 19.53125,
+        "compressed_mb": 9.765625,
+        "compression_ratio": 2.0,
+        "space_saved_percent": 50.0
+      },
+      "similarity_preservation": {
+        "method": "float16",
+        "mean_absolute_error": 7.550550435553305e-06,
+        "correlation": 0.9999999979602623,
+        "max_error": 3.895815461874008e-05
+      },
+      "recall": {
+        "recall@1": 1.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "recall@20": 1.0,
+        "recall@50": 1.0,
+        "recall@100": 0.99995
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.013039350509643555,
+          "time_per_query": 0.00013039350509643554,
+          "queries_per_second": 7669.093635150208
+        },
+        "compressed": {
+          "total_time": 0.013025522232055664,
+          "time_per_query": 0.00013025522232055665,
+          "queries_per_second": 7677.235370563579
+        }
+      }
+    },
+    "int8": {
+      "storage": {
+        "original_bytes": 20480000,
+        "compressed_bytes": 5120000,
+        "original_mb": 19.53125,
+        "compressed_mb": 4.8828125,
+        "compression_ratio": 4.0,
+        "space_saved_percent": 75.0
+      },
+      "similarity_preservation": {
+        "method": "int8",
+        "mean_absolute_error": 0.001510920817963779,
+        "correlation": 0.9999891066927592,
+        "max_error": 0.003698088228702545
+      },
+      "recall": {
+        "recall@1": 0.995,
+        "recall@5": 0.996,
+        "recall@10": 0.9954999999999999,
+        "recall@20": 0.9952500000000001,
+        "recall@50": 0.9960000000000001,
+        "recall@100": 0.99485
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.01253819465637207,
+          "time_per_query": 0.0001253819465637207,
+          "queries_per_second": 7975.629884576622
+        },
+        "compressed": {
+          "total_time": 0.012549638748168945,
+          "time_per_query": 0.00012549638748168945,
+          "queries_per_second": 7968.356859243498
+        }
+      }
+    },
+    "binary": {
+      "storage": {
+        "original_bytes": 20480000,
+        "compressed_bytes": 640000,
+        "original_mb": 19.53125,
+        "compressed_mb": 0.6103515625,
+        "compression_ratio": 32.0,
+        "space_saved_percent": 96.875
+      },
+      "similarity_preservation": {
+        "method": "binary",
+        "mean_absolute_error": 0.04668821394443512,
+        "correlation": 0.9457018349333416,
+        "max_error": 0.27445656061172485
+      },
+      "recall": {
+        "recall@1": 0.63,
+        "recall@5": 0.6919999999999998,
+        "recall@10": 0.7230000000000001,
+        "recall@20": 0.7075,
+        "recall@50": 0.7126,
+        "recall@100": 0.69965
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.013028383255004883,
+          "time_per_query": 0.00013028383255004884,
+          "queries_per_second": 7675.5494555769055
+        },
+        "compressed": {
+          "total_time": 0.014055490493774414,
+          "time_per_query": 0.00014055490493774413,
+          "queries_per_second": 7114.657438976812
+        }
+      }
+    }
+  }
+}

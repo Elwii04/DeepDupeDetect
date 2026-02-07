@@ -28,9 +28,10 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 # --- ALGORITHM UPGRADE: New strict threshold for CLIP model ---
 # 1.0 is identical. 0.98 is very strict to avoid false positives.
 # You can try 0.95 or 0.96 if you find it's missing some duplicates.
-SIMILARITY_THRESHOLD = 0.96
+SIMILARITY_THRESHOLD = 0.93
 
 # Model configurations
+# batch_size: GPU batch per step; higher is faster if VRAM and I/O can keep up.
 CLIP_MODELS = {
     'large': {'name': 'ViT-L-14', 'pretrained': 'openai', 'feature_dim': 768, 'batch_size': 450, 'type': 'clip'},
     'base': {'name': 'ViT-B-32', 'pretrained': 'openai', 'feature_dim': 512, 'batch_size': 512, 'type': 'clip'}
@@ -45,7 +46,15 @@ CURRENT_MODEL_CONFIG = CLIP_MODELS['large']  # Default to large model
 FEATURE_DIMENSION = CURRENT_MODEL_CONFIG['feature_dim']
 USE_LAST_HIDDEN_LAYER = False  # Default to final embedding
 
-NUM_WORKERS = os.cpu_count() - 3 if os.cpu_count() > 1 else 0
+NUM_WORKERS = max(0, (os.cpu_count() or 1) - 3)
+# Performance knobs: increase carefully to push throughput.
+# - NUM_WORKERS: DataLoader worker processes (CPU only). More can reduce GPU idle.
+# - MAX_CUDA_WORKERS / MAX_CPU_WORKERS: caps for DataLoader workers. There are no "GPU workers".
+#   When running on CUDA, a higher cap is usually safe; on CPU, too many workers can thrash.
+# - CLIP_DUAL_EMBED_BATCH_CAP: lowers batch size only when saving both embeddings.
+MAX_CUDA_WORKERS = os.cpu_count() - 4
+MAX_CPU_WORKERS = 4
+CLIP_DUAL_EMBED_BATCH_CAP = 356
 
 
 # --- UI/UX BUG FIX ---
@@ -559,7 +568,10 @@ class ImageDeduplicator:
                 print(f"  Final embedding: {self.final_embedding_dim}-dim")
             else:
                 print(f"  Dimensions: {self.model_config['feature_dim']}")
-            print(f"  Batch size: {self.model_config['batch_size']}")
+            if self.model_config['type'] == 'dinov3' and self.model_config['batch_size'] > 128:
+                print(f"  Batch size: {self.model_config['batch_size']} (capped to 128 for DINO preprocessing)")
+            else:
+                print(f"  Batch size: {self.model_config['batch_size']}")
         return True
 
     def _get_image_files(self, rescan_all):
@@ -601,23 +613,43 @@ class ImageDeduplicator:
         # 2. Create the DataLoader to run in parallel
         # Use the batch size from the selected model configuration
         # Choose appropriate collate function based on model type
+        is_cuda = self.device.startswith('cuda')
         if self.model_config['type'] == 'dinov3':
             # For DINOv3, pass model name so processor can be created in each worker
             collate_fn = DINOv3CollateFn(self.model_config['name'])
+            effective_batch_size = min(self.model_config['batch_size'], 128)
+            worker_count = max(1, min(4, NUM_WORKERS))  # limit workers to avoid RAM spikes
         else:
             collate_fn = collate_fn_clip
+            effective_batch_size = self.model_config['batch_size']
+            worker_count = NUM_WORKERS
+
+        if self.save_both_embeddings and self.model_config['type'] == 'clip':
+            effective_batch_size = min(effective_batch_size, CLIP_DUAL_EMBED_BATCH_CAP)
+            worker_cap = MAX_CUDA_WORKERS if is_cuda else MAX_CPU_WORKERS
+            worker_count = max(0, min(worker_count, worker_cap))
+        pin_memory = is_cuda
+
+        loader_kwargs = {}
+        if worker_count > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 1
         
         data_loader = DataLoader(
             dataset,
-            batch_size=self.model_config['batch_size'],
+            batch_size=effective_batch_size,
             shuffle=False,
-            num_workers=NUM_WORKERS,
+            num_workers=worker_count,
             collate_fn=collate_fn,
-            pin_memory=True
+            pin_memory=pin_memory,
+            **loader_kwargs
         )
         
-        print(f"Starting hashing with {NUM_WORKERS} parallel workers...")
-        embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
+        print(f"Starting hashing with {worker_count} parallel workers...")
+        if self.save_both_embeddings:
+            embedding_type = "both embeddings"
+        else:
+            embedding_type = "last hidden layer" if self.use_last_hidden_layer else "final embedding"
         print(f"Using {self.model_config['name']} with {embedding_type}")
         
         # 3. Iterate over the DataLoader, which provides batches
@@ -772,11 +804,11 @@ class ImageDeduplicator:
         # Get the total number of images to process. This is a very fast query.
         print("Getting image count from database(s)...")
         
-        # Load data from primary database
+        # Load data from primary database (only rows with valid embeddings)
         if hash_column == 'final_embedding_hash':
             self.cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
         else:
-            self.cursor.execute("SELECT COUNT(*) FROM images")
+            self.cursor.execute("SELECT COUNT(*) FROM images WHERE hash IS NOT NULL")
         num_images_primary = self.cursor.fetchone()[0]
         
         # Load data from secondary database if in multi-folder mode
@@ -785,7 +817,7 @@ class ImageDeduplicator:
             if hash_column == 'final_embedding_hash':
                 self.secondary_cursor.execute("SELECT COUNT(*) FROM images WHERE final_embedding_hash IS NOT NULL")
             else:
-                self.secondary_cursor.execute("SELECT COUNT(*) FROM images")
+                self.secondary_cursor.execute("SELECT COUNT(*) FROM images WHERE hash IS NOT NULL")
             num_images_secondary = self.secondary_cursor.fetchone()[0]
         
         num_images = num_images_primary + num_images_secondary
@@ -797,17 +829,17 @@ class ImageDeduplicator:
         # Get all file paths. Loading millions of strings is fine for RAM.
         print("Loading all file paths into memory...")
         if hash_column == 'final_embedding_hash':
-            self.cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL")
+            self.cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL ORDER BY absolute_path")
         else:
-            self.cursor.execute("SELECT absolute_path FROM images")
+            self.cursor.execute("SELECT absolute_path FROM images WHERE hash IS NOT NULL ORDER BY absolute_path")
         paths = [row[0] for row in self.cursor.fetchall()]
         
         # Add secondary database paths if in multi-folder mode
         if self.is_multi_folder_mode:
             if hash_column == 'final_embedding_hash':
-                self.secondary_cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL")
+                self.secondary_cursor.execute("SELECT absolute_path FROM images WHERE final_embedding_hash IS NOT NULL ORDER BY absolute_path")
             else:
-                self.secondary_cursor.execute("SELECT absolute_path FROM images")
+                self.secondary_cursor.execute("SELECT absolute_path FROM images WHERE hash IS NOT NULL ORDER BY absolute_path")
             secondary_paths = [row[0] for row in self.secondary_cursor.fetchall()]
             paths.extend(secondary_paths)
         
@@ -835,7 +867,13 @@ class ImageDeduplicator:
                 primary_start = offset
                 primary_size = min(size, num_images_primary - offset)
                 
-                query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                query = f"""
+                    SELECT {hash_column}
+                    FROM images
+                    WHERE {hash_column} IS NOT NULL
+                    ORDER BY absolute_path
+                    LIMIT ? OFFSET ?
+                """
                 self.cursor.execute(query, (primary_size, primary_start))
                 hashes_blob.extend([row[0] for row in self.cursor.fetchall()])
                 
@@ -844,7 +882,13 @@ class ImageDeduplicator:
                     secondary_start = 0
                     secondary_size = (offset + size) - num_images_primary
                     
-                    query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                    query = f"""
+                        SELECT {hash_column}
+                        FROM images
+                        WHERE {hash_column} IS NOT NULL
+                        ORDER BY absolute_path
+                        LIMIT ? OFFSET ?
+                    """
                     self.secondary_cursor.execute(query, (secondary_size, secondary_start))
                     hashes_blob.extend([row[0] for row in self.secondary_cursor.fetchall()])
             else:
@@ -852,7 +896,13 @@ class ImageDeduplicator:
                 secondary_start = offset - num_images_primary
                 secondary_size = size
                 
-                query = f"SELECT {hash_column} FROM images WHERE {hash_column} IS NOT NULL LIMIT ? OFFSET ?"
+                query = f"""
+                    SELECT {hash_column}
+                    FROM images
+                    WHERE {hash_column} IS NOT NULL
+                    ORDER BY absolute_path
+                    LIMIT ? OFFSET ?
+                """
                 self.secondary_cursor.execute(query, (secondary_size, secondary_start))
                 hashes_blob.extend([row[0] for row in self.secondary_cursor.fetchall()])
             

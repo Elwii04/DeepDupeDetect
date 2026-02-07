@@ -1,0 +1,268 @@
+{
+  "test_config": {
+    "database": "H:\\Raw Datasets\\Pinterest Downloader\\Downloads\\image_database - Kopie.db",
+    "num_test_images": null,
+    "num_query_samples": 1000,
+    "similarity_sample_size": 500,
+    "speed_query_samples": 200,
+    "speed_candidate_limit": 20000,
+    "timestamp": "2026-02-07T11:29:20.164499"
+  },
+  "original_embeddings": {
+    "model": "DINOv3 ViT-L (from database)",
+    "dimension": 1024,
+    "num_samples": 79893,
+    "storage_bytes": 327241728,
+    "storage_mb": 312.08203125
+  },
+  "compression": {
+    "float16": {
+      "storage": {
+        "original_bytes": 327241728,
+        "compressed_bytes": 163620864,
+        "original_mb": 312.08203125,
+        "compressed_mb": 156.041015625,
+        "compression_ratio": 2.0,
+        "space_saved_percent": 50.0
+      },
+      "similarity_preservation": {
+        "method": "float16",
+        "mean_absolute_error": 7.873410140746273e-06,
+        "rmse": 9.886172847473063e-06,
+        "p95_error": 1.9390136003494263e-05,
+        "pearson": 0.9999999974104409,
+        "spearman": 0.999999984957027,
+        "max_error": 4.252791404724121e-05
+      },
+      "recall": {
+        "mrr": 1.0,
+        "recall@1": 1.0,
+        "jaccard@1": 1.0,
+        "ndcg@1": 1.0,
+        "overlap@1": 1.0,
+        "recall@5": 0.9997999999999999,
+        "jaccard@5": 0.9996666666666666,
+        "ndcg@5": 0.9998687949224877,
+        "overlap@5": 4.999,
+        "recall@10": 1.0,
+        "jaccard@10": 1.0,
+        "ndcg@10": 1.0,
+        "overlap@10": 10.0,
+        "recall@20": 0.9999,
+        "jaccard@20": 0.9998095238095238,
+        "ndcg@20": 0.9999353234177033,
+        "overlap@20": 19.998,
+        "recall@50": 0.9998600000000001,
+        "jaccard@50": 0.9997254901960785,
+        "ndcg@50": 0.9999043211648709,
+        "overlap@50": 49.993,
+        "recall@100": 0.9999000000000001,
+        "jaccard@100": 0.9998019801980198,
+        "ndcg@100": 0.9999282712431341,
+        "overlap@100": 99.99
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.06975579261779785,
+          "time_per_query": 0.00034877896308898926,
+          "queries_per_second": 2867.1454010397265,
+          "candidates": 20000,
+          "queries": 200
+        },
+        "compressed": {
+          "total_time": 0.07960391044616699,
+          "time_per_query": 0.00039801955223083495,
+          "queries_per_second": 2512.4393874500947,
+          "candidates": 20000,
+          "queries": 200
+        }
+      }
+    },
+    "int8_vec_minmax": {
+      "storage": {
+        "original_bytes": 327241728,
+        "compressed_bytes": 82449576,
+        "original_mb": 312.08203125,
+        "compressed_mb": 78.63004302978516,
+        "compression_ratio": 3.9689922480620154,
+        "space_saved_percent": 74.8046875
+      },
+      "similarity_preservation": {
+        "method": "int8_vec_minmax",
+        "mean_absolute_error": 0.0004711332148872316,
+        "rmse": 0.0005945303128100932,
+        "p95_error": 0.0011729209683835492,
+        "pearson": 0.9999901847832847,
+        "spearman": 0.99997944320628,
+        "max_error": 0.0027408525347709656
+      },
+      "recall": {
+        "mrr": 0.993,
+        "recall@1": 0.986,
+        "jaccard@1": 0.986,
+        "ndcg@1": 0.986,
+        "overlap@1": 0.986,
+        "recall@5": 0.9936,
+        "jaccard@5": 0.9893333333333333,
+        "ndcg@5": 0.9957865742472748,
+        "overlap@5": 4.968,
+        "recall@10": 0.9937,
+        "jaccard@10": 0.9885454545454545,
+        "ndcg@10": 0.995973456296678,
+        "overlap@10": 9.937,
+        "recall@20": 0.99415,
+        "jaccard@20": 0.9888658008658009,
+        "ndcg@20": 0.9962010087082944,
+        "overlap@20": 19.883,
+        "recall@50": 0.9940200000000001,
+        "jaccard@50": 0.9883016591251886,
+        "ndcg@50": 0.9959045594780939,
+        "overlap@50": 49.701,
+        "recall@100": 0.99475,
+        "jaccard@100": 0.9896321595445831,
+        "ndcg@100": 0.9962280190338921,
+        "overlap@100": 99.475
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.07367181777954102,
+          "time_per_query": 0.0003683590888977051,
+          "queries_per_second": 2714.742299402593,
+          "candidates": 20000,
+          "queries": 200
+        },
+        "compressed": {
+          "total_time": 0.06415033340454102,
+          "time_per_query": 0.00032075166702270506,
+          "queries_per_second": 3117.676703857046,
+          "candidates": 20000,
+          "queries": 200
+        }
+      }
+    },
+    "int8_vec_maxabs": {
+      "storage": {
+        "original_bytes": 327241728,
+        "compressed_bytes": 82130004,
+        "original_mb": 312.08203125,
+        "compressed_mb": 78.32527542114258,
+        "compression_ratio": 3.9844357976653697,
+        "space_saved_percent": 74.90234375
+      },
+      "similarity_preservation": {
+        "method": "int8_vec_maxabs",
+        "mean_absolute_error": 0.0003233664610888809,
+        "rmse": 0.000407631800044328,
+        "p95_error": 0.0008035309612751005,
+        "pearson": 0.9999947663948806,
+        "spearman": 0.9999883117752214,
+        "max_error": 0.0018708109855651855
+      },
+      "recall": {
+        "mrr": 0.9965,
+        "recall@1": 0.993,
+        "jaccard@1": 0.993,
+        "ndcg@1": 0.993,
+        "overlap@1": 0.993,
+        "recall@5": 0.9925999999999999,
+        "jaccard@5": 0.9876666666666667,
+        "ndcg@5": 0.9951454121320433,
+        "overlap@5": 4.963,
+        "recall@10": 0.9945,
+        "jaccard@10": 0.990030303030303,
+        "ndcg@10": 0.9964876894727804,
+        "overlap@10": 9.945,
+        "recall@20": 0.99475,
+        "jaccard@20": 0.99,
+        "ndcg@20": 0.9965979687921476,
+        "overlap@20": 19.895,
+        "recall@50": 0.9958,
+        "jaccard@50": 0.9917722473604826,
+        "ndcg@50": 0.9971260827022738,
+        "overlap@50": 49.79,
+        "recall@100": 0.9963900000000001,
+        "jaccard@100": 0.9928631333721607,
+        "ndcg@100": 0.9974077668028215,
+        "overlap@100": 99.639
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.06661581993103027,
+          "time_per_query": 0.0003330790996551514,
+          "queries_per_second": 3002.289849574277,
+          "candidates": 20000,
+          "queries": 200
+        },
+        "compressed": {
+          "total_time": 0.06364059448242188,
+          "time_per_query": 0.0003182029724121094,
+          "queries_per_second": 3142.648204759336,
+          "candidates": 20000,
+          "queries": 200
+        }
+      }
+    },
+    "binary_sign": {
+      "storage": {
+        "original_bytes": 327241728,
+        "compressed_bytes": 10545876,
+        "original_mb": 312.08203125,
+        "compressed_mb": 10.057331085205078,
+        "compression_ratio": 31.03030303030303,
+        "space_saved_percent": 96.77734375
+      },
+      "similarity_preservation": {
+        "method": "binary_sign",
+        "mean_absolute_error": 0.4206984341144562,
+        "rmse": 0.4291994869709015,
+        "p95_error": 0.5210797995328903,
+        "pearson": 0.9429998741018655,
+        "spearman": 0.8963221759284473,
+        "max_error": 0.6043770909309387
+      },
+      "recall": {
+        "mrr": 0.7276890197955149,
+        "recall@1": 0.603,
+        "jaccard@1": 0.603,
+        "ndcg@1": 0.603,
+        "overlap@1": 0.603,
+        "recall@5": 0.6462,
+        "jaccard@5": 0.5125714285714286,
+        "ndcg@5": 0.7060377075401869,
+        "overlap@5": 3.231,
+        "recall@10": 0.6669,
+        "jaccard@10": 0.5262201478432129,
+        "ndcg@10": 0.7370131509406513,
+        "overlap@10": 6.669,
+        "recall@20": 0.67915,
+        "jaccard@20": 0.5314973905036428,
+        "ndcg@20": 0.7520609734419591,
+        "overlap@20": 13.583,
+        "recall@50": 0.70278,
+        "jaccard@50": 0.5554672647774755,
+        "ndcg@50": 0.7684354250800405,
+        "overlap@50": 35.139,
+        "recall@100": 0.7143,
+        "jaccard@100": 0.567195760647068,
+        "ndcg@100": 0.7719863934109021,
+        "overlap@100": 71.43
+      },
+      "speed": {
+        "original": {
+          "total_time": 0.07011175155639648,
+          "time_per_query": 0.0003505587577819824,
+          "queries_per_second": 2852.5888393919813,
+          "candidates": 20000,
+          "queries": 200
+        },
+        "compressed": {
+          "total_time": 2.724569082260132,
+          "time_per_query": 0.01362284541130066,
+          "queries_per_second": 73.4061034833782,
+          "candidates": 20000,
+          "queries": 200
+        }
+      }
+    }
+  }
+}
